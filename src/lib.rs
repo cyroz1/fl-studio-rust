@@ -15409,17 +15409,66 @@ impl FlpDocument {
         Ok(score)
     }
 
+    fn playlist_pattern_merge_marker_at(
+        &self,
+        marker: &TimeMarker,
+        merged_position: u64,
+    ) -> Result<PlaylistPatternMergeMarker, FlpError> {
+        if merged_position > u64::from(TIME_MARKER_TICK_MASK) {
+            return Err(FlpError::UnsupportedEdit(
+                "a merged Pattern time marker exceeds the supported position range",
+            ));
+        }
+        let raw_position = (marker.raw_position() & !TIME_MARKER_TICK_MASK)
+            | u32::try_from(merged_position).map_err(|_| FlpError::LengthOverflow)?;
+        let position_event_index =
+            marker
+                .source_events
+                .position
+                .ok_or(FlpError::UnsupportedEdit(
+                    "a Pattern time marker has no source position event",
+                ))?;
+        let mut source_event_indices = [
+            Some(position_event_index),
+            marker.source_events.numerator,
+            marker.source_events.denominator,
+            marker.source_events.name,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        source_event_indices.sort_unstable();
+        source_event_indices.dedup();
+        let mut events = Vec::with_capacity(source_event_indices.len());
+        for event_index in source_event_indices {
+            let mut event =
+                self.events
+                    .get(event_index)
+                    .cloned()
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "a Pattern time marker references a missing source event",
+                    ))?;
+            if event_index == position_event_index {
+                event.replace_dword_payload(raw_position)?;
+            }
+            events.push(event);
+        }
+        Ok(PlaylistPatternMergeMarker {
+            position: u32::try_from(merged_position).map_err(|_| FlpError::LengthOverflow)?,
+            events,
+        })
+    }
+
     /// Merges selected Pattern Clip scores into a new pattern assigned to the uppermost clip.
-    /// The output clip spans the selected timeline range; repeated source scores are expanded
-    /// into that range, with note tails clipped at source endpoints only when the project
-    /// disables Play truncated notes in clips. Raw Pattern controller
-    /// points are repeated and carried into the merged pattern without interpreting their
-    /// channel or flags. Recognized Pattern time markers are repeated with their raw flags and
-    /// meter/name events preserved. The receiver Pattern's name and color are retained. Original
-    /// patterns remain unchanged. Selected clips must share raw item flags, and unknown
-    /// per-pattern data and scaled clips are rejected because their score timing or payload is
-    /// not modeled. Trimmed or unrecognized Pattern source windows are rejected because this
-    /// merge path only expands full-source clips.
+    /// The output clip spans the selected timeline range; recognized one-to-one source windows
+    /// are expanded into that range, with note tails clipped at source endpoints only when the
+    /// project disables Play truncated notes in clips. Raw Pattern controller points are
+    /// repeated and carried into the merged pattern without interpreting their channel or flags.
+    /// Recognized Pattern time markers are repeated with their raw flags and meter/name events
+    /// preserved. The receiver Pattern's name and color are retained. Original patterns remain
+    /// unchanged. Selected clips must share raw item flags, and unknown per-pattern data, scaled
+    /// clips, and unrecognized source windows are rejected because their score timing or payload
+    /// is not modeled.
     pub fn merge_playlist_pattern_clips(
         &mut self,
         arrangement_id: u16,
@@ -15496,9 +15545,9 @@ impl FlpDocument {
                 ));
             }
             selected_item_flags.get_or_insert(clip.item_flags);
-            if clip.recognized_pattern_source_window_ticks() != Some((0, clip.length_ticks)) {
+            if clip.recognized_pattern_source_window_ticks().is_none() {
                 return Err(FlpError::UnsupportedEdit(
-                    "merging Pattern Clips with a trimmed or unrecognized source window is unsupported",
+                    "merging Pattern Clips with an unrecognized source window is unsupported",
                 ));
             }
             let clip_start = u64::from(clip.position_ticks);
@@ -15597,7 +15646,11 @@ impl FlpDocument {
             let source_notes = &score.notes;
             let source_controllers = &score.controllers;
             let source_time_markers = &score.time_markers;
-            let clip_length = u64::from(clip.length_ticks);
+            let (source_start_tick, source_end_tick) = clip
+                .recognized_pattern_source_window_ticks()
+                .expect("selected Pattern Clip source windows were checked above");
+            let source_start_tick = u64::from(source_start_tick);
+            let source_end_tick = u64::from(source_end_tick);
             let inferred_length = source_notes
                 .iter()
                 .filter(|note| note.length > 0)
@@ -15614,23 +15667,60 @@ impl FlpDocument {
                 .unwrap_or(if inferred_length > 0 {
                     inferred_length
                 } else {
-                    clip_length
+                    u64::from(clip.length_ticks)
                 });
-            let repetitions = clip_length.div_ceil(repeat_length);
+            let last_repetition = (source_end_tick - 1) / repeat_length;
             let clip_offset = u64::from(clip.position_ticks)
                 .checked_sub(merged_start)
                 .ok_or(FlpError::LengthOverflow)?;
 
             for note in source_notes {
-                if u64::from(note.position) >= clip_length {
+                let note_position = u64::from(note.position);
+                if note_position >= source_end_tick {
                     continue;
                 }
-                for repetition in 0..repetitions {
+                let first_repetition = if source_start_tick <= note_position {
+                    0
+                } else if play_truncated_notes_in_clips {
+                    if note.length == 0 {
+                        (source_start_tick - 1 - note_position) / repeat_length
+                    } else {
+                        let note_end = note_position
+                            .checked_add(u64::from(note.length))
+                            .ok_or(FlpError::LengthOverflow)?;
+                        if note_end > source_start_tick {
+                            0
+                        } else {
+                            (source_start_tick - note_end) / repeat_length + 1
+                        }
+                    }
+                } else {
+                    (source_start_tick - note_position).div_ceil(repeat_length)
+                };
+                if first_repetition > last_repetition {
+                    continue;
+                }
+                for repetition in first_repetition..=last_repetition {
                     let source_position = repetition
                         .checked_mul(repeat_length)
-                        .and_then(|start| start.checked_add(u64::from(note.position)))
+                        .and_then(|start| start.checked_add(note_position))
                         .ok_or(FlpError::LengthOverflow)?;
-                    if source_position >= clip_length {
+                    if source_position >= source_end_tick {
+                        continue;
+                    }
+                    let source_note_end = if note.length == 0 {
+                        None
+                    } else {
+                        Some(
+                            source_position
+                                .checked_add(u64::from(note.length))
+                                .ok_or(FlpError::LengthOverflow)?,
+                        )
+                    };
+                    if source_position < source_start_tick
+                        && (!play_truncated_notes_in_clips
+                            || source_note_end.is_some_and(|end| end <= source_start_tick))
+                    {
                         continue;
                     }
                     if merged_notes.len() >= MAX_MERGED_PATTERN_NOTES {
@@ -15638,16 +15728,26 @@ impl FlpDocument {
                             "merging would expand beyond 2,000,000 Pattern Clip notes",
                         ));
                     }
+                    let visible_source_start = source_position.max(source_start_tick);
+                    let visible_source_end = source_note_end.map(|end| {
+                        if play_truncated_notes_in_clips {
+                            end
+                        } else {
+                            end.min(source_end_tick)
+                        }
+                    });
                     let mut merged_note = note.clone();
                     merged_note.position = u32::try_from(
                         clip_offset
-                            .checked_add(source_position)
+                            .checked_add(visible_source_start - source_start_tick)
                             .ok_or(FlpError::LengthOverflow)?,
                     )
                     .map_err(|_| FlpError::LengthOverflow)?;
-                    if merged_note.length > 0 && !play_truncated_notes_in_clips {
+                    if let Some(visible_source_end) = visible_source_end {
                         merged_note.length = u32::try_from(
-                            u64::from(merged_note.length).min(clip_length - source_position),
+                            visible_source_end
+                                .checked_sub(visible_source_start)
+                                .ok_or(FlpError::LengthOverflow)?,
                         )
                         .map_err(|_| FlpError::LengthOverflow)?;
                     }
@@ -15655,16 +15755,57 @@ impl FlpDocument {
                 }
             }
 
-            for controller in source_controllers {
-                if u64::from(controller.position) >= clip_length {
+            let mut controller_state_before_window =
+                BTreeMap::<(u8, u8), (u64, usize, PatternController)>::new();
+            for (controller_index, controller) in source_controllers.iter().enumerate() {
+                let controller_position = u64::from(controller.position);
+                if controller_position >= source_start_tick {
                     continue;
                 }
-                for repetition in 0..repetitions {
+                let repetition = (source_start_tick - 1 - controller_position) / repeat_length;
+                let source_position = repetition
+                    .checked_mul(repeat_length)
+                    .and_then(|start| start.checked_add(controller_position))
+                    .ok_or(FlpError::LengthOverflow)?;
+                let stream = (controller.channel, controller.flags);
+                let candidate = (source_position, controller_index, *controller);
+                if controller_state_before_window
+                    .get(&stream)
+                    .is_none_or(|current| (candidate.0, candidate.1) > (current.0, current.1))
+                {
+                    controller_state_before_window.insert(stream, candidate);
+                }
+            }
+            for (_, _, mut controller) in controller_state_before_window.into_values() {
+                if merged_controllers.len() >= MAX_MERGED_PATTERN_NOTES {
+                    return Err(FlpError::UnsupportedEdit(
+                        "merging would expand beyond 2,000,000 Pattern controller points",
+                    ));
+                }
+                controller.position =
+                    u32::try_from(clip_offset).map_err(|_| FlpError::LengthOverflow)?;
+                merged_controllers.push(controller);
+            }
+
+            for controller in source_controllers {
+                let controller_position = u64::from(controller.position);
+                if controller_position >= source_end_tick {
+                    continue;
+                }
+                let first_repetition = if source_start_tick <= controller_position {
+                    0
+                } else {
+                    (source_start_tick - controller_position).div_ceil(repeat_length)
+                };
+                if first_repetition > last_repetition {
+                    continue;
+                }
+                for repetition in first_repetition..=last_repetition {
                     let source_position = repetition
                         .checked_mul(repeat_length)
-                        .and_then(|start| start.checked_add(u64::from(controller.position)))
+                        .and_then(|start| start.checked_add(controller_position))
                         .ok_or(FlpError::LengthOverflow)?;
-                    if source_position >= clip_length {
+                    if source_position < source_start_tick || source_position >= source_end_tick {
                         continue;
                     }
                     if merged_controllers.len() >= MAX_MERGED_PATTERN_NOTES {
@@ -15675,7 +15816,7 @@ impl FlpDocument {
                     let mut merged_controller = *controller;
                     merged_controller.position = u32::try_from(
                         clip_offset
-                            .checked_add(source_position)
+                            .checked_add(source_position - source_start_tick)
                             .ok_or(FlpError::LengthOverflow)?,
                     )
                     .map_err(|_| FlpError::LengthOverflow)?;
@@ -15683,17 +15824,54 @@ impl FlpDocument {
                 }
             }
 
-            for marker in source_time_markers {
+            let mut preceding_signature = None::<(u64, usize)>;
+            for (marker_index, marker) in source_time_markers.iter().enumerate() {
                 let marker_tick = u64::from(marker.position_ticks());
-                if marker_tick >= clip_length {
+                if !marker.is_signature() || marker_tick >= source_start_tick {
                     continue;
                 }
-                for repetition in 0..repetitions {
+                let repetition = (source_start_tick - 1 - marker_tick) / repeat_length;
+                let source_position = repetition
+                    .checked_mul(repeat_length)
+                    .and_then(|start| start.checked_add(marker_tick))
+                    .ok_or(FlpError::LengthOverflow)?;
+                if preceding_signature
+                    .is_none_or(|current| (source_position, marker_index) > current)
+                {
+                    preceding_signature = Some((source_position, marker_index));
+                }
+            }
+            if let Some((_, marker_index)) = preceding_signature {
+                if merged_time_markers.len() >= MAX_MERGED_PATTERN_NOTES {
+                    return Err(FlpError::UnsupportedEdit(
+                        "merging would expand beyond 2,000,000 Pattern time markers",
+                    ));
+                }
+                merged_time_markers.push(self.playlist_pattern_merge_marker_at(
+                    &source_time_markers[marker_index],
+                    clip_offset,
+                )?);
+            }
+
+            for marker in source_time_markers {
+                let marker_tick = u64::from(marker.position_ticks());
+                if marker_tick >= source_end_tick {
+                    continue;
+                }
+                let first_repetition = if source_start_tick <= marker_tick {
+                    0
+                } else {
+                    (source_start_tick - marker_tick).div_ceil(repeat_length)
+                };
+                if first_repetition > last_repetition {
+                    continue;
+                }
+                for repetition in first_repetition..=last_repetition {
                     let source_position = repetition
                         .checked_mul(repeat_length)
                         .and_then(|start| start.checked_add(marker_tick))
                         .ok_or(FlpError::LengthOverflow)?;
-                    if source_position >= clip_length {
+                    if source_position < source_start_tick || source_position >= source_end_tick {
                         continue;
                     }
                     if merged_time_markers.len() >= MAX_MERGED_PATTERN_NOTES {
@@ -15702,50 +15880,10 @@ impl FlpDocument {
                         ));
                     }
                     let merged_position = clip_offset
-                        .checked_add(source_position)
+                        .checked_add(source_position - source_start_tick)
                         .ok_or(FlpError::LengthOverflow)?;
-                    if merged_position > u64::from(TIME_MARKER_TICK_MASK) {
-                        return Err(FlpError::UnsupportedEdit(
-                            "a merged Pattern time marker exceeds the supported position range",
-                        ));
-                    }
-                    let raw_position = (marker.raw_position() & !TIME_MARKER_TICK_MASK)
-                        | u32::try_from(merged_position).map_err(|_| FlpError::LengthOverflow)?;
-                    let position_event_index =
-                        marker
-                            .source_events
-                            .position
-                            .ok_or(FlpError::UnsupportedEdit(
-                                "a Pattern time marker has no source position event",
-                            ))?;
-                    let mut source_event_indices = [
-                        Some(position_event_index),
-                        marker.source_events.numerator,
-                        marker.source_events.denominator,
-                        marker.source_events.name,
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
-                    source_event_indices.sort_unstable();
-                    source_event_indices.dedup();
-                    let mut marker_events = Vec::with_capacity(source_event_indices.len());
-                    for event_index in source_event_indices {
-                        let mut event = self.events.get(event_index).cloned().ok_or(
-                            FlpError::UnsupportedEdit(
-                                "a Pattern time marker references a missing source event",
-                            ),
-                        )?;
-                        if event_index == position_event_index {
-                            event.replace_dword_payload(raw_position)?;
-                        }
-                        marker_events.push(event);
-                    }
-                    merged_time_markers.push(PlaylistPatternMergeMarker {
-                        position: u32::try_from(merged_position)
-                            .map_err(|_| FlpError::LengthOverflow)?,
-                        events: marker_events,
-                    });
+                    merged_time_markers
+                        .push(self.playlist_pattern_merge_marker_at(marker, merged_position)?);
                 }
             }
         }
