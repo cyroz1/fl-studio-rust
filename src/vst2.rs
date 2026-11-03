@@ -14,6 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::media::{DecodedAudio, decode_audio_file, write_audio_range_to_wav};
+use crate::midi::fl_note_release_to_midi_velocity;
 use crate::sample_render::swing_note_start_tick;
 use crate::vst3::{MixerEffectProcessor, MixerEffectProcessorFactory};
 use crate::{ChannelPluginState, PatternNote};
@@ -2281,7 +2282,11 @@ fn prepare_vst2_pattern_events(
         events.push(ScheduledVst2MidiEvent {
             frame: end_frame,
             priority: 0,
-            data: [0x80 | channel_status, key, 0],
+            data: [
+                0x80 | channel_status,
+                key,
+                fl_note_release_to_midi_velocity(note.release),
+            ],
         });
         note_count += 1;
     }

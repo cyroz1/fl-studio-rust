@@ -6973,7 +6973,7 @@ fn render_pattern_vst2(
         summary.channels,
     );
     println!(
-        "render is a VST2 channel stem with {} app-local Pattern Event parameter lanes; FLP per-note pitch, pan, release, and modulation, unlinked Pattern Event streams, Mixer routing, and effects are not applied",
+        "render is a VST2 channel stem with {} app-local Pattern Event parameter lanes; FLP per-note pitch, pan, and modulation, unlinked Pattern Event streams, Mixer routing, and effects are not applied; FL note release values are sent as MIDI Note Off velocity",
         parameter_automation.len(),
     );
     Ok(())
