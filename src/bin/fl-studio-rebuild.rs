@@ -68954,6 +68954,27 @@ impl DawUi {
                                     1 => "1 saved state record".to_owned(),
                                     count => format!("{count} saved state records"),
                                 };
+                                let grouped_effect_slots = if self
+                                    .selected_mixer_inserts
+                                    .contains(&insert.ordinal())
+                                    && self.selected_mixer_inserts.len() > 1
+                                    && slot.plugin_identifier().is_some()
+                                {
+                                    effect_slots
+                                        .iter()
+                                        .filter(|selected_slot| {
+                                            selected_slot.insert_ordinal() != insert.ordinal()
+                                                && self.selected_mixer_inserts.contains(
+                                                    &selected_slot.insert_ordinal(),
+                                                )
+                                                && selected_slot.slot_index() == slot.slot_index()
+                                                && selected_slot.plugin_identifier()
+                                                    == slot.plugin_identifier()
+                                        })
+                                        .collect::<Vec<_>>()
+                                } else {
+                                    Vec::new()
+                                };
                                 let slot_key = (insert.ordinal(), slot.slot_index());
                                 let clap_effect_assignment =
                                     clap_mixer_effect_assignments.get(&slot_key);
@@ -69470,7 +69491,12 @@ impl DawUi {
                                             }
                                             ui.horizontal(|ui| {
                                                 if let Some(mut enabled) = slot.enabled() {
-                                                    if ui.checkbox(&mut enabled, "Enabled").changed()
+                                                    let enabled_response = ui
+                                                        .checkbox(&mut enabled, "Enabled")
+                                                        .on_hover_text(
+                                                            "Matching effect slots on the other selected inserts follow this enabled state.",
+                                                        );
+                                                    if enabled_response.changed()
                                                         && let Some((event_index, record_index)) =
                                                             slot.enabled_parameter_location()
                                                     {
@@ -69479,6 +69505,20 @@ impl DawUi {
                                                             record_index,
                                                             if enabled { 1 } else { 0 },
                                                         ));
+                                                        for selected_slot in
+                                                            &grouped_effect_slots
+                                                        {
+                                                            if let Some((event_index, record_index)) =
+                                                                selected_slot
+                                                                    .enabled_parameter_location()
+                                                            {
+                                                                parameter_edits.push((
+                                                                    event_index,
+                                                                    record_index,
+                                                                    if enabled { 1 } else { 0 },
+                                                                ));
+                                                            }
+                                                        }
                                                     }
                                                 } else {
                                                     ui.small(
@@ -69488,7 +69528,8 @@ impl DawUi {
                                                 }
                                                 if let Some(mut mix_raw) = slot.mix_raw() {
                                                     if (-6_400..=6_400).contains(&mix_raw) {
-                                                        if ui
+                                                        let original_mix_raw = mix_raw;
+                                                        let mix_response = ui
                                                             .add(
                                                                 egui::Slider::new(
                                                                     &mut mix_raw,
@@ -69496,15 +69537,49 @@ impl DawUi {
                                                                 )
                                                                 .text("Mix raw"),
                                                             )
-                                                            .changed()
+                                                            .on_hover_text(
+                                                                "Matching effect slots on the other selected inserts follow the same raw mix change, clamped to the supported range.",
+                                                            );
+                                                        if mix_response.changed()
                                                             && let Some((event_index, record_index)) =
                                                                 slot.mix_parameter_location()
                                                         {
+                                                            let mix_delta = mix_raw - original_mix_raw;
                                                             parameter_edits.push((
                                                                 event_index,
                                                                 record_index,
                                                                 mix_raw,
                                                             ));
+                                                            for selected_slot in
+                                                                &grouped_effect_slots
+                                                            {
+                                                                let Some(selected_mix) =
+                                                                    selected_slot.mix_raw()
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                let Some((event_index, record_index)) =
+                                                                    selected_slot
+                                                                        .mix_parameter_location()
+                                                                else {
+                                                                    continue;
+                                                                };
+                                                                if !(-6_400..=6_400)
+                                                                    .contains(&selected_mix)
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                let grouped_mix = (selected_mix
+                                                                    + mix_delta)
+                                                                    .clamp(-6_400, 6_400);
+                                                                if grouped_mix != selected_mix {
+                                                                    parameter_edits.push((
+                                                                        event_index,
+                                                                        record_index,
+                                                                        grouped_mix,
+                                                                    ));
+                                                                }
+                                                            }
                                                         }
                                                     } else {
                                                         ui.small(
