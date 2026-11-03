@@ -6622,9 +6622,9 @@ fn schedule_playlist_preview_events(
                 note.velocity
             ));
         }
-        if !(-1200..=1200).contains(&note.fine_pitch_cents) {
+        if !(-2500..=2500).contains(&note.fine_pitch_cents) {
             return Err(format!(
-                "CLAP Playlist fine pitch {} is outside −1200…1200 cents",
+                "CLAP Playlist fine pitch {} is outside −2500…2500 cents",
                 note.fine_pitch_cents
             ));
         }
@@ -6820,9 +6820,9 @@ fn schedule_pattern_preview_events(
                 note.velocity
             ));
         }
-        if !(-1200..=1200).contains(&note.fine_pitch_cents) {
+        if !(-2500..=2500).contains(&note.fine_pitch_cents) {
             return Err(format!(
-                "CLAP Pattern preview fine pitch {} is outside −1200…1200 cents",
+                "CLAP Pattern preview fine pitch {} is outside −2500…2500 cents",
                 note.fine_pitch_cents
             ));
         }
@@ -7815,7 +7815,7 @@ mod tests {
         assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
 
         let mut settings = pattern_preview_settings();
-        settings.notes[0].fine_pitch_cents = 1201;
+        settings.notes[0].fine_pitch_cents = 2501;
         assert!(schedule_pattern_preview_events(&settings, 48_000).is_err());
 
         let mut settings = pattern_preview_settings();

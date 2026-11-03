@@ -729,6 +729,36 @@ fn project_channel_master_pitch_note_offset_semitones(
             channel.master_pitch_note_offset_semitones(project_master_pitch_cents)
         })
 }
+
+fn project_channel_pitch_offsets(document: &FlpDocument) -> HashMap<u16, (i16, i16)> {
+    let project_master_pitch_cents = document.metadata().master_pitch_cents();
+    document
+        .channels()
+        .into_iter()
+        .map(|channel| {
+            let continuous_pitch_cents = channel
+                .master_pitch_render_offset_cents(project_master_pitch_cents)
+                .saturating_add(channel.keyboard_fine_tune_cents().unwrap_or_default() as i16);
+            let note_transpose_semitones =
+                channel.master_pitch_note_offset_semitones(project_master_pitch_cents);
+            (
+                channel.id(),
+                (continuous_pitch_cents, note_transpose_semitones),
+            )
+        })
+        .collect()
+}
+
+fn apply_project_channel_pitch_to_clap_note(
+    key: &mut u16,
+    fine_pitch_cents: &mut i16,
+    (continuous_pitch_cents, note_transpose_semitones): (i16, i16),
+) {
+    if *key <= 127 {
+        *key = (i32::from(*key) + i32::from(note_transpose_semitones)).clamp(0, 127) as u16;
+    }
+    *fine_pitch_cents = (*fine_pitch_cents).saturating_add(continuous_pitch_cents);
+}
 const FL_GENRES: &[&str] = &[
     "(none)",
     "Acid House",
@@ -27269,6 +27299,10 @@ impl DawUi {
             .into_iter()
             .find(|pattern| pattern.id == pattern_id)
             .ok_or_else(|| format!("Pattern {pattern_id} was not found"))?;
+        let pitch_offsets = project_channel_pitch_offsets(document)
+            .get(&channel_id)
+            .copied()
+            .unwrap_or_default();
         let notes = pattern
             .notes
             .iter()
@@ -27278,17 +27312,26 @@ impl DawUi {
                     && note.length > 0
                     && (note.velocity > 0 || note.is_slide_note())
             })
-            .map(|note| ClapPatternNote {
-                position_ticks: note.position,
-                length_ticks: note.length,
-                key: note.key,
-                velocity: note.velocity,
-                midi_channel: note.midi_channel_index(),
-                fine_pitch_cents: note.fine_pitch_offset_cents(),
-                pan: note.pan.min(128),
-                release: note.release.min(128),
-                mod_x: note.mod_x,
-                slide_note: note.is_slide_note(),
+            .map(|note| {
+                let mut key = note.key;
+                let mut fine_pitch_cents = note.fine_pitch_offset_cents();
+                apply_project_channel_pitch_to_clap_note(
+                    &mut key,
+                    &mut fine_pitch_cents,
+                    pitch_offsets,
+                );
+                ClapPatternNote {
+                    position_ticks: note.position,
+                    length_ticks: note.length,
+                    key,
+                    velocity: note.velocity,
+                    midi_channel: note.midi_channel_index(),
+                    fine_pitch_cents,
+                    pan: note.pan.min(128),
+                    release: note.release.min(128),
+                    mod_x: note.mod_x,
+                    slide_note: note.is_slide_note(),
+                }
             })
             .collect::<Vec<_>>();
         if notes.is_empty() {
@@ -27376,9 +27419,21 @@ impl DawUi {
 
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(self.tempo_bpm);
+        let pitch_offsets_by_channel = project_channel_pitch_offsets(document);
         notes_by_layer_route
             .into_iter()
-            .map(|((channel_id, gain_bits, pan_raw), notes)| {
+            .map(|((channel_id, gain_bits, pan_raw), mut notes)| {
+                let pitch_offsets = pitch_offsets_by_channel
+                    .get(&channel_id)
+                    .copied()
+                    .unwrap_or_default();
+                for note in &mut notes {
+                    apply_project_channel_pitch_to_clap_note(
+                        &mut note.key,
+                        &mut note.fine_pitch_cents,
+                        pitch_offsets,
+                    );
+                }
                 let (left_gain, right_gain) = project_channel_stereo_output_gains_with_layer_adjustments(
                     document,
                     channel_id,
@@ -27674,6 +27729,7 @@ impl DawUi {
             .collect::<Vec<_>>();
         let ppq = document.header().ppq();
         let tempo_bpm = document.metadata().tempo_bpm().unwrap_or(140.0);
+        let pitch_offsets_by_channel = project_channel_pitch_offsets(document);
         let mut parameter_automation_by_layer_route = parameter_points_by_layer_route
             .into_iter()
             .map(|(route, parameters)| {
@@ -27706,7 +27762,18 @@ impl DawUi {
             .collect::<BTreeMap<_, _>>();
         notes_by_layer_route
             .into_iter()
-            .map(|(route @ (channel_id, layer_gain_bits, layer_pan_raw), notes)| {
+            .map(|(route @ (channel_id, layer_gain_bits, layer_pan_raw), mut notes)| {
+                let pitch_offsets = pitch_offsets_by_channel
+                    .get(&channel_id)
+                    .copied()
+                    .unwrap_or_default();
+                for note in &mut notes {
+                    apply_project_channel_pitch_to_clap_note(
+                        &mut note.key,
+                        &mut note.fine_pitch_cents,
+                        pitch_offsets,
+                    );
+                }
                 let loop_length_ticks = notes
                     .iter()
                     .map(|note| note.stop_tick)
@@ -27897,10 +27964,22 @@ impl DawUi {
                 .push(note);
         }
         let ppq = document.header().ppq();
+        let pitch_offsets_by_channel = project_channel_pitch_offsets(document);
         notes_by_route
             .into_iter()
             .map(
-                |((clip_index, pattern_id, channel_id, left_gain, right_gain), notes)| {
+                |((clip_index, pattern_id, channel_id, left_gain, right_gain), mut notes)| {
+                    let pitch_offsets = pitch_offsets_by_channel
+                        .get(&channel_id)
+                        .copied()
+                        .unwrap_or_default();
+                    for note in &mut notes {
+                        apply_project_channel_pitch_to_clap_note(
+                            &mut note.key,
+                            &mut note.fine_pitch_cents,
+                            pitch_offsets,
+                        );
+                    }
                     let clip = arrangement.clips.get(clip_index).ok_or_else(|| {
                         format!(
                             "Performance CLAP Pattern Clip {} disappeared",
@@ -81229,7 +81308,7 @@ impl DawUi {
                     ui.colored_label(ORANGE, error);
                 }
             }
-                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies only to all-Sampler child subtrees; external CLAP and VST3 children retain unity Layer gain, matching FL Studio’s native-format-only rule. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale Pattern clips with recognized 88-byte source windows whose span matches the clip length. Performance Mode launches pre-rendered CLAP-backed Pattern Clip loops, piecewise pitch-preserving time-stretched to follow Playlist tempo changes from the tempo active at Start. It applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Nondefault scales and unrecognized legacy source windows remain unsupported. Performance Mode supports default-scale clips with recognized source windows whose tick span matches the clip length. Native CLAP Mixer bus mapping remains unverified, and tempo-stretch quality still needs native comparison; assigned CLAP instrument editors save state and writable parameter overrides on close, stopping transport so instrument state reloads on restart. Mixer writable parameters synchronize to active processing while the editor is open. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, pan, Mod X brightness, and release; MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
+                ui.small("Pattern previews use project base tempo. CLAP Pattern transport expands Layer notes to assigned CLAP child channels, applies Layer gain/pan and source-channel gain/pan, and follows Mixer routes including loaded VST3 insert effects. Layer Crossfade applies only to all-Sampler child subtrees; external CLAP and VST3 children retain unity Layer gain, matching FL Studio’s native-format-only rule. CLAP Playlist playback follows clip repeats, track mute/solo, Layer routing and gain/pan, and tempo automation for default-scale Pattern clips with recognized 88-byte source windows whose span matches the clip length. Performance Mode launches pre-rendered CLAP-backed Pattern Clip loops, piecewise pitch-preserving time-stretched to follow Playlist tempo changes from the tempo active at Start. It applies saved channel and Layer gain/pan, linked fader/pan automation, Pattern Event links, Pattern LFO links, and Playlist Automation parameter links. Pattern Event points take precedence over LFOs for a shared parameter. Nondefault scales and unrecognized legacy source windows remain unsupported. Performance Mode supports default-scale clips with recognized source windows whose tick span matches the clip length. Native CLAP Mixer bus mapping remains unverified, and tempo-stretch quality still needs native comparison; assigned CLAP instrument editors save state and writable parameter overrides on close, stopping transport so instrument state reloads on restart. Mixer writable parameters synchronize to active processing while the editor is open. Full-song Playlist mix and Mixer stem renders also pre-render assigned CLAP instruments, including Pattern Event, Pattern LFO, and Playlist Automation parameter links plus linked Playlist fader/pan automation. CLAP note-dialect plug-ins receive per-note tuning, including channel Fine Tune and enabled project Master pitch, pan, Mod X brightness, and release; Add to Key transposes their note keys. MIDI 1.0/2.0 inputs receive key, velocity, channel, and release.");
             if let Ok(Some(settings)) = &clap_pattern_preview_settings {
                 ui.horizontal(|ui| {
                     if let Some(instrument) = self
