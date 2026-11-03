@@ -35,10 +35,10 @@ use flp_rebuild::{
     FscControllerStreamImportOptions, FscScore, FstPreset, FstPresetKind, HumanizerOptions,
     LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerParameterKind, PatternController,
     PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PlaylistClipEdit,
-    PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit,
-    ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode, QuantizeNoteOptions,
-    RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions, RiffMachineOptions,
-    RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+    PlaylistClipTarget, PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress,
+    PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit, QuantizeNoteLevels, QuantizeNoteMode,
+    QuantizeNoteOptions, RandomNoteChordMap, RandomNoteGeneratorOptions, RandomizerOptions,
+    RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
     SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, StrumOptions, TimeMarkerEdit,
 };
 
@@ -4146,6 +4146,19 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 parse_optional_u32(length, "timeline length ticks")?,
             )
         }
+        [command, input, output, arrangement_id, clip_index, source_start_tick, source_end_tick, length]
+            if command == "edit-pattern-clip-window-ticks" =>
+        {
+            edit_pattern_clip_window_ticks(
+                Path::new(input),
+                Path::new(output),
+                parse_u16(arrangement_id, "arrangement id")?,
+                parse_usize(clip_index, "clip index")?,
+                parse_u32(source_start_tick, "source start tick")?,
+                parse_u32(source_end_tick, "source end tick")?,
+                parse_optional_u32(length, "timeline length ticks")?,
+            )
+        }
         [command, input, output, arrangement_id, clip_index, position, raw_track_index]
             if command == "duplicate-clip" =>
         {
@@ -5366,6 +5379,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "  flp-rebuild rename-playlist-track <input.flp> <output.flp> <track-id> <name>\n",
             "  flp-rebuild edit-clip-properties <input.flp> <output.flp> <arrangement-id> <clip-index> <item-index-raw|-> <track-index-raw|-> <group-raw|-> <flags-raw|-> <start-offset|-> <end-offset|-> <scale|->\n",
             "  flp-rebuild edit-audio-clip-window-ticks <input.flp> <output.flp> <arrangement-id> <clip-index> <source-start-tick> <source-end-tick> <timeline-length|->\n",
+            "  flp-rebuild edit-pattern-clip-window-ticks <input.flp> <output.flp> <arrangement-id> <clip-index> <source-start-tick> <source-end-tick> <timeline-length|->\n",
             "  flp-rebuild duplicate-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <position|-> <track-index-raw|->\n",
             "  flp-rebuild split-audio-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks> <source-length-ms|->\n",
             "  flp-rebuild split-pattern-clip <input.flp> <output.flp> <arrangement-id> <clip-index> <split-position-ticks>\n",
@@ -13925,6 +13939,59 @@ fn edit_audio_clip_window_ticks(
         .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     println!(
         "updated arrangement {arrangement_id} Audio Clip {clip_index} source window to ticks {source_start_tick}..{source_end_tick} in {}",
+        output.display()
+    );
+    Ok(())
+}
+
+fn edit_pattern_clip_window_ticks(
+    input: &Path,
+    output: &Path,
+    arrangement_id: u16,
+    clip_index: usize,
+    source_start_tick: u32,
+    source_end_tick: u32,
+    length_ticks: Option<u32>,
+) -> Result<(), String> {
+    let (_, mut document) = load_document(input)?;
+    let arrangements = document.arrangements().map_err(|error| error.to_string())?;
+    let arrangement = arrangements
+        .iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} does not exist"))?;
+    if arrangements
+        .iter()
+        .filter(|arrangement| arrangement.id == arrangement_id)
+        .count()
+        > 1
+    {
+        return Err(format!("arrangement {arrangement_id} is ambiguous"));
+    }
+    let clip = arrangement
+        .clips
+        .get(clip_index)
+        .ok_or_else(|| format!("Playlist clip index {clip_index} does not exist"))?;
+    if clip.record_size != 88 || !matches!(clip.target(), PlaylistClipTarget::Pattern { .. }) {
+        return Err("source tick editing requires an 88-byte Pattern Clip".to_owned());
+    }
+    document
+        .edit_playlist_clip(
+            arrangement_id,
+            clip_index,
+            PlaylistClipEdit {
+                source_window_ticks: Some((source_start_tick, source_end_tick)),
+                length_ticks,
+                ..PlaylistClipEdit::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let bytes = document
+        .encode_lossless()
+        .map_err(|error| format!("could not encode {}: {error}", input.display()))?;
+    fs::write(output, bytes)
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    println!(
+        "updated arrangement {arrangement_id} Pattern Clip {clip_index} source window to ticks {source_start_tick}..{source_end_tick} in {}",
         output.display()
     );
     Ok(())
