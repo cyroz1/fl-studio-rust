@@ -69139,10 +69139,12 @@ impl DawUi {
                                             ui.horizontal(|ui| {
                                                 ui.small("Color");
                                                 let mut slot_color = slot_color_stroke;
-                                                if ui
+                                                let color_response = ui
                                                     .color_edit_button_srgba(&mut slot_color)
-                                                    .changed()
-                                                {
+                                                    .on_hover_text(
+                                                        "Matching effect slots on the other selected inserts follow this color.",
+                                                    );
+                                                if color_response.changed() {
                                                     let color_raw = u32::from(slot_color.r())
                                                         | (u32::from(slot_color.g()) << 8)
                                                         | (u32::from(slot_color.b()) << 16);
@@ -69151,6 +69153,13 @@ impl DawUi {
                                                         slot.slot_index(),
                                                         color_raw,
                                                     ));
+                                                    for selected_slot in &grouped_effect_slots {
+                                                        effect_slot_color_edits.push((
+                                                            selected_slot.insert_ordinal(),
+                                                            selected_slot.slot_index(),
+                                                            color_raw,
+                                                        ));
+                                                    }
                                                 }
                                                 if let Some(instance_id) = loaded_effect_instance
                                                     && ui.small_button("Open editor").clicked()
@@ -70598,21 +70607,35 @@ impl DawUi {
         if !effect_slot_color_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
+            let edit_count = effect_slot_color_edits.len();
+            let first_edit = effect_slot_color_edits.first().copied();
+            let mut candidate = document.clone();
+            let mut changed_tracks = BTreeSet::new();
+            let mut edit_error = None;
             for (insert_ordinal, slot_index, color_raw) in effect_slot_color_edits {
-                match document.set_mixer_effect_slot_color(insert_ordinal, slot_index, color_raw) {
-                    Ok(()) => {
-                        dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
-                        mixer_refresh_flags |= SCRIPT_HW_DIRTY_COLORS;
-                        self.dirty = true;
-                        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                        self.status = format!(
-                            "Changed Mixer insert {insert_ordinal} effect slot {slot_index} color"
-                        );
-                    }
-                    Err(error) => {
-                        self.status = format!("Could not change Mixer effect-slot color: {error}");
-                    }
+                if let Err(error) =
+                    candidate.set_mixer_effect_slot_color(insert_ordinal, slot_index, color_raw)
+                {
+                    edit_error = Some(error);
+                    break;
                 }
+                changed_tracks.insert(insert_ordinal);
+            }
+            if let Some(error) = edit_error {
+                self.status = format!("Could not change Mixer effect-slot color: {error}");
+            } else if let Some((insert_ordinal, slot_index, _)) = first_edit {
+                *document = candidate;
+                for changed_track in &changed_tracks {
+                    dirty_mixer_tracks.insert(i32::try_from(*changed_track).unwrap_or(-1));
+                }
+                mixer_refresh_flags |= SCRIPT_HW_DIRTY_COLORS;
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                self.status = if edit_count == 1 {
+                    format!("Changed Mixer insert {insert_ordinal} effect slot {slot_index} color")
+                } else {
+                    format!("Changed color on {edit_count} matching Mixer effect slots")
+                };
             }
         }
         let mut mixer_solo_mode_resets = Vec::new();
