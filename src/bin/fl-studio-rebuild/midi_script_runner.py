@@ -1690,6 +1690,8 @@ def _get_rec_ppq():
 
 
 def _get_rec_pps():
+    # The PPQ / 4 step size is inferred from sixteenth-note recording steps;
+    # the native API documents PPQ dependence but not this exact formula.
     return max(1, _get_rec_ppq() // 4)
 
 
