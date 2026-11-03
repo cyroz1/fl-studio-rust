@@ -819,6 +819,36 @@ impl Vst2HostRuntime {
         result
     }
 
+    /// Set one loaded Channel Rack parameter in its editor worker and queue it for audio processing.
+    pub fn set_channel_parameter(
+        &mut self,
+        channel_id: u16,
+        parameter_id: u32,
+        value: f64,
+    ) -> Result<(), String> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err("VST2 channel parameter value must be normalized to 0–1".to_owned());
+        }
+        let request = {
+            let channel = self
+                .channels
+                .get_mut(&channel_id)
+                .ok_or_else(|| format!("VST2 channel {channel_id} is not loaded"))?;
+            let request = channel
+                .instance
+                .controller()
+                .request(Command::SetParameter {
+                    id: parameter_id,
+                    value,
+                })
+                .map_err(|error| format!("could not set VST2 channel parameter: {error}"))?;
+            channel.queue_parameter_edit(parameter_id, value);
+            request
+        };
+        self.pending_editor_requests.insert((channel_id, request));
+        Ok(())
+    }
+
     /// Request the native editor for one loaded VST2 Mixer effect.
     pub fn open_mixer_effect_editor(&mut self, key: (usize, u16)) -> Result<(), String> {
         let effect = self.mixer_effects.get(&key).ok_or_else(|| {

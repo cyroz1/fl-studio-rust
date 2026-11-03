@@ -6056,6 +6056,7 @@ struct DawUi {
     vst3_manual_latency_offset_keys: BTreeMap<u64, String>,
     vst3_manual_latency_offset_labels: BTreeMap<u64, String>,
     channel_vst3_instances: BTreeMap<u16, u64>,
+    vst2_channel_plugin_paths: BTreeMap<u16, PathBuf>,
     vst2_channel_parameter_snapshots: BTreeMap<u16, Vst2ChannelParameterSnapshot>,
     mixer_effect_vst3_instances: BTreeMap<(usize, u16), u64>,
     vst2_mixer_effect_assignments: BTreeMap<(usize, u16), Vst2ProjectMixerEffectAssignment>,
@@ -6117,6 +6118,7 @@ struct DawUi {
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
+    midi_vst2_channel_parameter_mappings: Vec<MidiVst2ChannelParameterMapping>,
     midi_vst2_mixer_effect_parameter_mappings: Vec<MidiVst2MixerEffectParameterMapping>,
     pattern_clap_parameter_links: Vec<PatternClapParameterLink>,
     pattern_clap_lfo_parameter_links: Vec<PatternClapLfoParameterLink>,
@@ -6137,6 +6139,7 @@ struct DawUi {
     playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
     playlist_automatic_crossfades: Vec<ProjectPlaylistAutomaticCrossfades>,
     midi_vst3_parameter_learning: Option<MidiVst3ParameterMappingTarget>,
+    midi_vst2_channel_parameter_learning: Option<MidiVst2ChannelParameterTarget>,
     midi_vst2_mixer_effect_parameter_learning: Option<MidiVst2MixerEffectParameterTarget>,
     midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
@@ -7546,6 +7549,23 @@ struct MidiVst2MixerEffectParameterTarget {
     fourcc: String,
     parameter_id: u32,
     parameter_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiVst2ChannelParameterTarget {
+    project_channel_id: u16,
+    plugin_path: String,
+    fourcc: String,
+    parameter_id: u32,
+    parameter_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiVst2ChannelParameterMapping {
+    input_device_id: String,
+    channel: u8,
+    controller: u8,
+    target: MidiVst2ChannelParameterTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9134,6 +9154,7 @@ impl DawUi {
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
+        let midi_vst2_channel_parameter_mappings = load_midi_vst2_channel_parameter_mappings();
         let midi_vst2_mixer_effect_parameter_mappings =
             load_midi_vst2_mixer_effect_parameter_mappings();
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
@@ -9659,6 +9680,7 @@ impl DawUi {
             vst3_manual_latency_offset_keys: BTreeMap::new(),
             vst3_manual_latency_offset_labels: BTreeMap::new(),
             channel_vst3_instances: BTreeMap::new(),
+            vst2_channel_plugin_paths: BTreeMap::new(),
             vst2_channel_parameter_snapshots: BTreeMap::new(),
             mixer_effect_vst3_instances: BTreeMap::new(),
             vst2_mixer_effect_assignments: BTreeMap::new(),
@@ -9719,6 +9741,7 @@ impl DawUi {
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
+            midi_vst2_channel_parameter_mappings,
             midi_vst2_mixer_effect_parameter_mappings,
             pattern_clap_parameter_links,
             pattern_clap_lfo_parameter_links,
@@ -9739,6 +9762,7 @@ impl DawUi {
             playlist_audio_clip_envelopes,
             playlist_automatic_crossfades,
             midi_vst3_parameter_learning: None,
+            midi_vst2_channel_parameter_learning: None,
             midi_vst2_mixer_effect_parameter_learning: None,
             midi_mixer_button_cc_active: BTreeSet::new(),
             midi_mixer_control_learning: None,
@@ -13362,8 +13386,14 @@ impl DawUi {
 
     fn load_project_vst2_plugins(&mut self) -> Option<String> {
         self.vst2_host = None;
+        self.vst2_channel_plugin_paths.clear();
         self.vst2_channel_parameter_snapshots.clear();
         let document = self.document.as_ref()?;
+        let midi_parameter_targets = self
+            .midi_vst2_channel_parameter_mappings
+            .iter()
+            .map(|mapping| mapping.target.project_channel_id)
+            .collect::<BTreeSet<_>>();
         let native_automation_channel_targets = document
             .automation_target_links()
             .unwrap_or_default()
@@ -13433,7 +13463,11 @@ impl DawUi {
             match host.load_channel(path.clone(), &state) {
                 Ok(_) => {
                     loaded_count += 1;
-                    if native_automation_channel_targets.contains(&channel_id) {
+                    self.vst2_channel_plugin_paths
+                        .insert(channel_id, path.clone());
+                    if native_automation_channel_targets.contains(&channel_id)
+                        || midi_parameter_targets.contains(&channel_id)
+                    {
                         let fourcc = state
                             .vst_metadata()
                             .and_then(|metadata| metadata.fourcc())
@@ -13444,7 +13478,7 @@ impl DawUi {
                                 self.vst2_channel_parameter_snapshots.insert(
                                     channel_id,
                                     Vst2ChannelParameterSnapshot {
-                                        plugin_path: path,
+                                        plugin_path: path.clone(),
                                         fourcc,
                                         parameters,
                                     },
@@ -43196,6 +43230,10 @@ impl DawUi {
         let mut open_editor = None;
         let mut open_vst2_editor = None;
         let mut capture_vst2_channel_state = None;
+        let mut vst2_channel_parameters_refresh = None;
+        let mut midi_vst2_channel_parameter_learn_request = None;
+        let mut midi_vst2_channel_parameter_cancel_learning = false;
+        let mut midi_vst2_channel_parameter_remove_mapping = None;
         let mut open_group_dialog = false;
         let mut open_empty_group_dialog = false;
         let mut rename_group_dialog = None;
@@ -44725,6 +44763,90 @@ impl DawUi {
                             );
                             }
                         });
+                        if !zipped && loaded_vst2_channels.contains(&channel.id()) {
+                            ui.collapsing("VST2 MIDI parameters", |ui| {
+                                ui.small("MIDI changes are live; use Capture state to save plug-in values into the project.");
+                                if ui.small_button("Refresh parameters").clicked() {
+                                    vst2_channel_parameters_refresh = Some(channel.id());
+                                }
+                                let snapshot = self
+                                    .vst2_channel_parameter_snapshots
+                                    .get(&channel.id())
+                                    .filter(|snapshot| {
+                                        self.vst2_channel_plugin_paths
+                                            .get(&channel.id())
+                                            .is_some_and(|path| path == &snapshot.plugin_path)
+                                    });
+                                let Some(snapshot) = snapshot else {
+                                    ui.small("Refresh parameters to see the plug-in's automatable controls.");
+                                    return;
+                                };
+                                let parameters = snapshot
+                                    .parameters
+                                    .iter()
+                                    .filter(|parameter| parameter.automatable && !parameter.read_only)
+                                    .collect::<Vec<_>>();
+                                if parameters.is_empty() {
+                                    ui.small("The plug-in reports no writable automatable parameters.");
+                                    return;
+                                }
+                                for parameter in parameters {
+                                    let parameter_name = if parameter.name.is_empty() {
+                                        format!("Parameter {}", parameter.id)
+                                    } else {
+                                        parameter.name.clone()
+                                    };
+                                    let target = MidiVst2ChannelParameterTarget {
+                                        project_channel_id: channel.id(),
+                                        plugin_path: snapshot.plugin_path.to_string_lossy().into_owned(),
+                                        fourcc: snapshot.fourcc.clone(),
+                                        parameter_id: parameter.id,
+                                        parameter_name: parameter_name.clone(),
+                                    };
+                                    let mapping = midi_vst2_channel_parameter_mapping_for_target(
+                                        &self.midi_vst2_channel_parameter_mappings,
+                                        &target,
+                                    );
+                                    let learning = self
+                                        .midi_vst2_channel_parameter_learning
+                                        .as_ref()
+                                        == Some(&target);
+                                    ui.horizontal_wrapped(|ui| {
+                                        let label = format!("{parameter_name} · ID {}", parameter.id);
+                                        ui.small(label);
+                                        if learning {
+                                            if ui.small_button("Cancel learn").clicked() {
+                                                midi_vst2_channel_parameter_cancel_learning = true;
+                                            }
+                                        } else if ui
+                                            .add_enabled(
+                                                self.midi_input_connection.is_some(),
+                                                egui::Button::new(if mapping.is_some() {
+                                                    "Relearn CC"
+                                                } else {
+                                                    "Learn CC"
+                                                }),
+                                            )
+                                            .clicked()
+                                        {
+                                            midi_vst2_channel_parameter_learn_request =
+                                                Some(target.clone());
+                                        }
+                                        if let Some(mapping) = mapping {
+                                            ui.small(format!(
+                                                "CC {} · Ch {}",
+                                                mapping.controller,
+                                                mapping.channel + 1
+                                            ));
+                                            if ui.small_button("Clear CC").clicked() {
+                                                midi_vst2_channel_parameter_remove_mapping =
+                                                    Some(target.clone());
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                        }
                         if !zipped {
                         if let Some((key_low, key_high)) = channel.keyboard_key_region() {
                             let mut low_key = key_low;
@@ -46242,6 +46364,90 @@ impl DawUi {
                         format!("Could not capture VST2 state for Channel {channel_id}: {error}");
                 }
             }
+        }
+        if let Some(channel_id) = vst2_channel_parameters_refresh {
+            let plugin_path = self.vst2_channel_plugin_paths.get(&channel_id).cloned();
+            let fourcc = self.document.as_ref().and_then(|document| {
+                document
+                    .channel_plugin_states()
+                    .into_iter()
+                    .find(|state| state.channel_id() == channel_id)
+                    .and_then(|state| {
+                        state
+                            .vst_metadata()
+                            .and_then(|metadata| metadata.fourcc())
+                            .map(str::to_owned)
+                    })
+            });
+            let identity = plugin_path.zip(fourcc);
+            let result = identity
+                .ok_or_else(|| format!("VST2 Channel {channel_id} identity is unavailable"))
+                .and_then(|(plugin_path, fourcc)| {
+                    self.vst2_host
+                        .as_ref()
+                        .ok_or_else(|| "VST2 host is not available".to_owned())
+                        .and_then(|runtime| {
+                            runtime
+                                .lock()
+                                .map_err(|_| "VST2 host lock was poisoned".to_owned())?
+                                .channel_parameters(channel_id)
+                        })
+                        .map(|parameters| (plugin_path, fourcc, parameters))
+                });
+            match result {
+                Ok((plugin_path, fourcc, parameters)) => {
+                    self.vst2_channel_parameter_snapshots.insert(
+                        channel_id,
+                        Vst2ChannelParameterSnapshot {
+                            plugin_path,
+                            fourcc,
+                            parameters,
+                        },
+                    );
+                    self.status = format!("Loaded VST2 parameter list for Channel {channel_id}");
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Could not read VST2 parameters for Channel {channel_id}: {error}");
+                }
+            }
+        }
+        if midi_vst2_channel_parameter_cancel_learning {
+            self.midi_vst2_channel_parameter_learning = None;
+            self.status = "MIDI CC learn cancelled".to_owned();
+        }
+        if let Some(target) = midi_vst2_channel_parameter_remove_mapping {
+            remove_midi_vst2_channel_parameter_mapping(
+                &mut self.midi_vst2_channel_parameter_mappings,
+                &target,
+            );
+            if self.midi_vst2_channel_parameter_learning.as_ref() == Some(&target) {
+                self.midi_vst2_channel_parameter_learning = None;
+            }
+            self.status = save_midi_vst2_channel_parameter_mappings(
+                &self.midi_vst2_channel_parameter_mappings,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared MIDI CC link for VST2 {}", target.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared VST2 MIDI CC link for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        if let Some(target) = midi_vst2_channel_parameter_learn_request {
+            self.midi_vst3_parameter_learning = None;
+            self.midi_vst2_mixer_effect_parameter_learning = None;
+            self.midi_mixer_control_learning = None;
+            self.midi_output_gain_learning = false;
+            self.midi_play_pause_learning = false;
+            self.midi_vst2_channel_parameter_learning = Some(target.clone());
+            self.status = format!(
+                "Move a MIDI CC to link it to VST2 {}",
+                target.parameter_name
+            );
         }
         if open_group_dialog {
             self.open_channel_group_dialog();
@@ -66768,6 +66974,7 @@ impl DawUi {
                                                             )
                                                             .clicked()
                                                         {
+                                                            self.midi_vst2_channel_parameter_learning = None;
                                                             self.midi_vst2_mixer_effect_parameter_learning = None;
                                                             self.midi_output_gain_learning = false;
                                                             self.midi_play_pause_learning = false;
@@ -66921,6 +67128,7 @@ impl DawUi {
                                                             )
                                                             .clicked()
                                                         {
+                                                            self.midi_vst2_channel_parameter_learning = None;
                                                             self.midi_vst2_mixer_effect_parameter_learning = None;
                                                             self.midi_output_gain_learning = false;
                                                             self.midi_play_pause_learning = false;
@@ -67063,6 +67271,7 @@ impl DawUi {
                                                                 )
                                                                 .clicked()
                                                             {
+                                                                self.midi_vst2_channel_parameter_learning = None;
                                                                 self.midi_vst2_mixer_effect_parameter_learning = None;
                                                                 self.midi_output_gain_learning = false;
                                                                 self.midi_play_pause_learning = false;
@@ -67393,6 +67602,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_channel_parameter_learning = None;
                                     self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
@@ -67463,6 +67673,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_channel_parameter_learning = None;
                                     self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
@@ -67535,6 +67746,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_channel_parameter_learning = None;
                                     self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
@@ -67608,6 +67820,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_channel_parameter_learning = None;
                                     self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
@@ -67680,6 +67893,7 @@ impl DawUi {
                                         )
                                         .clicked()
                                     {
+                                        self.midi_vst2_channel_parameter_learning = None;
                                         self.midi_vst2_mixer_effect_parameter_learning = None;
                                         self.midi_output_gain_learning = false;
                                         self.midi_play_pause_learning = false;
@@ -68266,6 +68480,7 @@ impl DawUi {
                                                 && clap_effect_assignment.is_none()
                                             {
                                                 ui.collapsing("VST2 parameter automation", |ui| {
+                                                    ui.small("Capture VST2 state to save changed parameter values into the project.");
                                                     if ui.small_button("Refresh parameters").clicked() {
                                                         vst2_effect_parameters_refresh = Some(slot_key);
                                                     }
@@ -70561,6 +70776,7 @@ impl DawUi {
             }
         }
         if midi_vst2_effect_parameter_cancel_learning {
+            self.midi_vst2_channel_parameter_learning = None;
             self.midi_vst2_mixer_effect_parameter_learning = None;
             self.status = "MIDI CC learn cancelled".to_owned();
         }
@@ -70570,6 +70786,7 @@ impl DawUi {
                 &target,
             );
             if self.midi_vst2_mixer_effect_parameter_learning.as_ref() == Some(&target) {
+                self.midi_vst2_channel_parameter_learning = None;
                 self.midi_vst2_mixer_effect_parameter_learning = None;
             }
             self.status = save_midi_vst2_mixer_effect_parameter_mappings(
@@ -70587,6 +70804,7 @@ impl DawUi {
         }
         if let Some(target) = midi_vst2_effect_parameter_learn_request {
             self.midi_vst3_parameter_learning = None;
+            self.midi_vst2_channel_parameter_learning = None;
             self.midi_mixer_control_learning = None;
             self.midi_output_gain_learning = false;
             self.midi_play_pause_learning = false;
@@ -71115,6 +71333,8 @@ impl DawUi {
         self.midi_output_gain_learning = false;
         self.finish_midi_script_transport_move();
         self.midi_mixer_control_learning = None;
+        self.midi_vst2_channel_parameter_learning = None;
+        self.midi_vst2_mixer_effect_parameter_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
         self.midi_mixer_button_cc_active.clear();
@@ -71181,6 +71401,8 @@ impl DawUi {
         self.stop_midi_input_thru();
         self.midi_output_gain_learning = false;
         self.midi_mixer_control_learning = None;
+        self.midi_vst2_channel_parameter_learning = None;
+        self.midi_vst2_mixer_effect_parameter_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
         self.midi_mixer_button_cc_active.clear();
@@ -73827,6 +74049,8 @@ impl DawUi {
         self.midi_play_pause_mapping = play_pause;
         self.midi_output_gain_learning = false;
         self.midi_mixer_control_learning = None;
+        self.midi_vst2_channel_parameter_learning = None;
+        self.midi_vst2_mixer_effect_parameter_learning = None;
         self.midi_play_pause_learning = false;
         self.midi_play_pause_cc_active = false;
         self.midi_mixer_button_cc_active.clear();
@@ -73881,8 +74105,49 @@ impl DawUi {
             return;
         };
 
+        if let Some(target) = self.midi_vst2_channel_parameter_learning.clone() {
+            let Some(connection) = self.midi_input_connection.as_ref() else {
+                self.midi_vst2_channel_parameter_learning = None;
+                self.status =
+                    "Connect a MIDI input before learning a VST2 channel parameter".into();
+                return;
+            };
+            let mapping = MidiVst2ChannelParameterMapping {
+                input_device_id: connection.device_id.clone(),
+                channel,
+                controller,
+                target,
+            };
+            upsert_midi_vst2_channel_parameter_mapping(
+                &mut self.midi_vst2_channel_parameter_mappings,
+                mapping.clone(),
+            );
+            self.midi_vst2_channel_parameter_learning = None;
+            let apply_error = self
+                .set_midi_vst2_channel_parameter_mapping_value(&mapping, value)
+                .err();
+            let save_error = save_midi_vst2_channel_parameter_mappings(
+                &self.midi_vst2_channel_parameter_mappings,
+            )
+            .err();
+            self.status = apply_error.or(save_error).map_or_else(
+                || {
+                    format!(
+                        "Learned MIDI CC {controller} · channel {} for VST2 {}",
+                        channel + 1,
+                        mapping.target.parameter_name
+                    )
+                },
+                |error| {
+                    format!("Learned MIDI CC, but the VST2 update or mapping save failed: {error}")
+                },
+            );
+            return;
+        }
+
         if let Some(target) = self.midi_vst2_mixer_effect_parameter_learning.clone() {
             let Some(connection) = self.midi_input_connection.as_ref() else {
+                self.midi_vst2_channel_parameter_learning = None;
                 self.midi_vst2_mixer_effect_parameter_learning = None;
                 self.status = "Connect a MIDI input before learning a VST2 effect parameter".into();
                 return;
@@ -73897,6 +74162,7 @@ impl DawUi {
                 &mut self.midi_vst2_mixer_effect_parameter_mappings,
                 mapping.clone(),
             );
+            self.midi_vst2_channel_parameter_learning = None;
             self.midi_vst2_mixer_effect_parameter_learning = None;
             let apply_error = self
                 .set_midi_vst2_mixer_effect_parameter_mapping_value(&mapping, value)
@@ -74150,6 +74416,35 @@ impl DawUi {
         else {
             return;
         };
+        let has_vst2_channel_mappings = !midi_vst2_channel_parameter_mappings_for_cc(
+            &self.midi_vst2_channel_parameter_mappings,
+            &input_device_id,
+            channel,
+            controller,
+        )
+        .is_empty();
+        if has_vst2_channel_mappings {
+            match self.apply_midi_vst2_channel_parameter_control_change(
+                &input_device_id,
+                channel,
+                controller,
+                value,
+            ) {
+                Ok(applied) if applied > 0 => {
+                    self.status =
+                        format!("MIDI CC {controller} updated {applied} VST2 channel parameter(s)");
+                }
+                Ok(_) => {
+                    self.status = format!(
+                        "MIDI CC {controller} matches a VST2 channel link, but its plug-in is not loaded"
+                    );
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Could not apply MIDI VST2 channel parameter link: {error}");
+                }
+            }
+        }
         let has_vst2_mappings = !midi_vst2_mixer_effect_parameter_mappings_for_cc(
             &self.midi_vst2_mixer_effect_parameter_mappings,
             &input_device_id,
@@ -74263,6 +74558,66 @@ impl DawUi {
         Ok(true)
     }
 
+    fn set_midi_vst2_channel_parameter_mapping_value(
+        &mut self,
+        mapping: &MidiVst2ChannelParameterMapping,
+        value: u8,
+    ) -> Result<bool, String> {
+        let target = &mapping.target;
+        let Some(snapshot) = self
+            .vst2_channel_parameter_snapshots
+            .get(&target.project_channel_id)
+            .filter(|snapshot| {
+                snapshot.fourcc == target.fourcc
+                    && snapshot.plugin_path.to_string_lossy().as_ref()
+                        == target.plugin_path.as_str()
+            })
+        else {
+            return Ok(false);
+        };
+        if !snapshot.parameters.iter().any(|parameter| {
+            parameter.id == target.parameter_id && parameter.automatable && !parameter.read_only
+        }) {
+            return Ok(false);
+        }
+        let Some(runtime) = self.vst2_host.as_ref().cloned() else {
+            return Ok(false);
+        };
+        runtime
+            .lock()
+            .map_err(|_| "VST2 channel host lock was poisoned".to_owned())?
+            .set_channel_parameter(
+                target.project_channel_id,
+                target.parameter_id,
+                f64::from(value) / 127.0,
+            )?;
+        Ok(true)
+    }
+
+    fn apply_midi_vst2_channel_parameter_control_change(
+        &mut self,
+        input_device_id: &str,
+        channel: u8,
+        controller: u8,
+        value: u8,
+    ) -> Result<usize, String> {
+        let mappings = midi_vst2_channel_parameter_mappings_for_cc(
+            &self.midi_vst2_channel_parameter_mappings,
+            input_device_id,
+            channel,
+            controller,
+        )
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        let mut applied = 0;
+        for mapping in &mappings {
+            applied +=
+                usize::from(self.set_midi_vst2_channel_parameter_mapping_value(mapping, value)?);
+        }
+        Ok(applied)
+    }
+
     fn set_midi_vst2_mixer_effect_parameter_mapping_value(
         &mut self,
         mapping: &MidiVst2MixerEffectParameterMapping,
@@ -74301,8 +74656,6 @@ impl DawUi {
             .lock()
             .map_err(|_| "VST2 Mixer effect editor host lock was poisoned".to_owned())?
             .set_mixer_effect_parameter(key, target.parameter_id, f64::from(value) / 127.0)?;
-        self.dirty = true;
-        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
         if !self.notify_midi_script_mixer_tracks_changed(
             &[i32::try_from(target.insert_ordinal).unwrap_or(-1)],
             SCRIPT_HW_DIRTY_CONTROL_VALUES,
@@ -79683,6 +80036,7 @@ impl DawUi {
                 self.midi_mixer_control_learning = None;
                 self.midi_play_pause_learning = false;
                 self.midi_play_pause_cc_active = false;
+                self.midi_vst2_channel_parameter_learning = None;
                 self.midi_vst2_mixer_effect_parameter_learning = None;
                 self.midi_output_gain_learning = true;
                 self.status = "Move a MIDI CC control to map output gain".to_owned();
@@ -79734,6 +80088,7 @@ impl DawUi {
             {
                 self.midi_output_gain_learning = false;
                 self.midi_mixer_control_learning = None;
+                self.midi_vst2_channel_parameter_learning = None;
                 self.midi_vst2_mixer_effect_parameter_learning = None;
                 self.midi_play_pause_learning = true;
                 self.midi_play_pause_cc_active = false;
@@ -82298,6 +82653,7 @@ impl DawUi {
                 );
         }
         if let Some(target) = midi_vst3_learn_request {
+            self.midi_vst2_channel_parameter_learning = None;
             self.midi_vst2_mixer_effect_parameter_learning = None;
             self.midi_vst3_parameter_learning = Some(target.clone());
             self.status = format!("Move a MIDI CC to link it to {}", target.parameter_name());
@@ -86338,6 +86694,10 @@ fn midi_vst3_parameter_mappings_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-vst3-parameter-mappings.txt")
 }
 
+fn midi_vst2_channel_parameter_mappings_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("midi-vst2-channel-parameter-mappings.txt")
+}
+
 fn midi_vst2_mixer_effect_parameter_mappings_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-vst2-mixer-effect-parameter-mappings.txt")
 }
@@ -86451,6 +86811,13 @@ fn load_midi_vst3_parameter_mappings() -> Vec<MidiVst3ParameterMapping> {
     midi_vst3_parameter_mappings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_midi_vst3_parameter_mappings(&contents))
+        .unwrap_or_default()
+}
+
+fn load_midi_vst2_channel_parameter_mappings() -> Vec<MidiVst2ChannelParameterMapping> {
+    midi_vst2_channel_parameter_mappings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_midi_vst2_channel_parameter_mappings(&contents))
         .unwrap_or_default()
 }
 
@@ -86817,6 +87184,23 @@ fn save_midi_vst2_mixer_effect_parameter_mappings(
     fs::write(
         &path,
         serialize_midi_vst2_mixer_effect_parameter_mappings(mappings),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_midi_vst2_channel_parameter_mappings(
+    mappings: &[MidiVst2ChannelParameterMapping],
+) -> Result<(), String> {
+    let path = midi_vst2_channel_parameter_mappings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the VST2 channel parameter mapping path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_midi_vst2_channel_parameter_mappings(mappings),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
@@ -87388,6 +87772,157 @@ fn serialize_midi_vst2_mixer_effect_parameter_mappings(
         contents.push_str(&mapping.target.insert_ordinal.to_string());
         contents.push('\t');
         contents.push_str(&mapping.target.slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&mapping.target.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&mapping.target.fourcc));
+        contents.push('\t');
+        contents.push_str(&mapping.target.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&mapping.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn valid_midi_vst2_channel_parameter_mapping(mapping: &MidiVst2ChannelParameterMapping) -> bool {
+    !mapping.input_device_id.is_empty()
+        && mapping.channel < 16
+        && mapping.controller < 128
+        && !mapping.target.plugin_path.is_empty()
+        && mapping.target.fourcc.len() == 4
+        && mapping.target.fourcc.is_ascii()
+        && !mapping.target.parameter_name.is_empty()
+}
+
+fn same_midi_vst2_channel_parameter_target(
+    left: &MidiVst2ChannelParameterTarget,
+    right: &MidiVst2ChannelParameterTarget,
+) -> bool {
+    left.project_channel_id == right.project_channel_id
+        && left.plugin_path == right.plugin_path
+        && left.fourcc == right.fourcc
+        && left.parameter_id == right.parameter_id
+}
+
+fn upsert_midi_vst2_channel_parameter_mapping(
+    mappings: &mut Vec<MidiVst2ChannelParameterMapping>,
+    mapping: MidiVst2ChannelParameterMapping,
+) {
+    if !valid_midi_vst2_channel_parameter_mapping(&mapping) {
+        return;
+    }
+    mappings.retain(|existing| {
+        !same_midi_vst2_channel_parameter_target(&existing.target, &mapping.target)
+    });
+    mappings.push(mapping);
+}
+
+fn remove_midi_vst2_channel_parameter_mapping(
+    mappings: &mut Vec<MidiVst2ChannelParameterMapping>,
+    target: &MidiVst2ChannelParameterTarget,
+) {
+    mappings.retain(|mapping| !same_midi_vst2_channel_parameter_target(&mapping.target, target));
+}
+
+fn midi_vst2_channel_parameter_mapping_for_target<'a>(
+    mappings: &'a [MidiVst2ChannelParameterMapping],
+    target: &MidiVst2ChannelParameterTarget,
+) -> Option<&'a MidiVst2ChannelParameterMapping> {
+    mappings
+        .iter()
+        .find(|mapping| same_midi_vst2_channel_parameter_target(&mapping.target, target))
+}
+
+fn midi_vst2_channel_parameter_mappings_for_cc<'a>(
+    mappings: &'a [MidiVst2ChannelParameterMapping],
+    input_device_id: &str,
+    channel: u8,
+    controller: u8,
+) -> Vec<&'a MidiVst2ChannelParameterMapping> {
+    mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.input_device_id == input_device_id
+                && mapping.channel == channel
+                && mapping.controller == controller
+        })
+        .collect()
+}
+
+fn parse_midi_vst2_channel_parameter_mappings(
+    contents: &str,
+) -> Vec<MidiVst2ChannelParameterMapping> {
+    let mut mappings = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("mapping=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(input_device_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(controller) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(fourcc) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_midi_vst2_channel_parameter_mapping(
+            &mut mappings,
+            MidiVst2ChannelParameterMapping {
+                input_device_id,
+                channel,
+                controller,
+                target: MidiVst2ChannelParameterTarget {
+                    project_channel_id,
+                    plugin_path,
+                    fourcc,
+                    parameter_id,
+                    parameter_name,
+                },
+            },
+        );
+    }
+    mappings
+}
+
+fn serialize_midi_vst2_channel_parameter_mappings(
+    mappings: &[MidiVst2ChannelParameterMapping],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for mapping in mappings {
+        upsert_midi_vst2_channel_parameter_mapping(&mut normalized, mapping.clone());
+    }
+    for mapping in normalized {
+        contents.push_str("mapping=");
+        contents.push_str(&encode_midi_device_id(&mapping.input_device_id));
+        contents.push('\t');
+        contents.push_str(&mapping.channel.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.controller.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.target.project_channel_id.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&mapping.target.plugin_path));
         contents.push('\t');
