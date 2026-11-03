@@ -67030,6 +67030,13 @@ impl DawUi {
             return;
         }
 
+        let select_all_mixer_tracks = !ui.ctx().egui_wants_keyboard_input()
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::A));
+        if select_all_mixer_tracks {
+            self.selected_mixer_inserts = inserts.iter().map(|insert| insert.ordinal()).collect();
+            self.selected_mixer_insert = self.selected_mixer_inserts.first().copied();
+        }
+
         if let Some(mut enabled) = automatic_pdc_enabled {
             ui.horizontal(|ui| {
                 if ui
@@ -67223,21 +67230,37 @@ impl DawUi {
                                                             format!("Insert {}", insert.ordinal())
                                                         }
                                                     });
-                                                if ui
-                                                    .add_sized(
-                                                        [104.0, 26.0],
-                                                        egui::Button::selectable(
-                                                            selected,
-                                                            display_name,
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    self.selected_mixer_insert =
-                                                        Some(insert.ordinal());
-                                                    self.selected_mixer_inserts.clear();
-                                                    self.selected_mixer_inserts
-                                                        .insert(insert.ordinal());
+                                                let track_button = ui.add_sized(
+                                                    [104.0, 26.0],
+                                                    egui::Button::selectable(selected, display_name),
+                                                );
+                                                let multi_select_modifier = ui.input(|input| {
+                                                    input.modifiers.shift
+                                                        && (input.modifiers.command
+                                                            || input.modifiers.ctrl)
+                                                });
+                                                if track_button.clicked() {
+                                                    let track_ordinal = insert.ordinal();
+                                                    if multi_select_modifier {
+                                                        if !self
+                                                            .selected_mixer_inserts
+                                                            .remove(&track_ordinal)
+                                                        {
+                                                            self.selected_mixer_inserts
+                                                                .insert(track_ordinal);
+                                                        }
+                                                        self.selected_mixer_insert = self
+                                                            .selected_mixer_inserts
+                                                            .first()
+                                                            .copied()
+                                                            .or(Some(track_ordinal));
+                                                    } else {
+                                                        self.selected_mixer_insert =
+                                                            Some(track_ordinal);
+                                                        self.selected_mixer_inserts.clear();
+                                                        self.selected_mixer_inserts
+                                                            .insert(track_ordinal);
+                                                    }
                                                 }
                                                 ui.horizontal(|ui| {
                                                     let flags_editable = insert.flags().is_some();
