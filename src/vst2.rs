@@ -745,6 +745,37 @@ impl Vst2HostRuntime {
         )
     }
 
+    /// Set one loaded Mixer effect parameter in its editor worker and the active audio processor.
+    pub fn set_mixer_effect_parameter(
+        &mut self,
+        key: (usize, u16),
+        parameter_id: u32,
+        value: f64,
+    ) -> Result<(), String> {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err("VST2 Mixer effect parameter value must be normalized to 0–1".to_owned());
+        }
+        let effect = self.mixer_effects.get(&key).ok_or_else(|| {
+            format!(
+                "VST2 Mixer insert {} effect slot {} is not loaded",
+                key.0,
+                key.1 + 1
+            )
+        })?;
+        let request = effect
+            .instance
+            .controller()
+            .request(Command::SetParameter {
+                id: parameter_id,
+                value,
+            })
+            .map_err(|error| format!("could not set VST2 Mixer effect parameter: {error}"))?;
+        self.pending_mixer_editor_requests.insert(request, key);
+        self.mixer_effect_parameter_sync
+            .publish(key, parameter_id, value);
+        Ok(())
+    }
+
     /// Read a bounded snapshot of the parameters exposed by one loaded Channel Rack plug-in.
     pub fn channel_parameters(
         &mut self,

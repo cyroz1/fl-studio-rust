@@ -1211,6 +1211,47 @@ fn remap_midi_vst3_mixer_effect_parameter_targets_after_move(
     changed
 }
 
+fn remap_midi_vst2_mixer_effect_parameter_target_after_move(
+    target: &mut MidiVst2MixerEffectParameterTarget,
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) -> bool {
+    if from_slot == to_slot || target.insert_ordinal != insert_ordinal {
+        return false;
+    }
+    let next_slot = if target.slot_index == from_slot {
+        to_slot
+    } else if from_slot < to_slot && from_slot < target.slot_index && target.slot_index <= to_slot {
+        target.slot_index - 1
+    } else if to_slot < from_slot && to_slot <= target.slot_index && target.slot_index < from_slot {
+        target.slot_index + 1
+    } else {
+        target.slot_index
+    };
+    let changed = next_slot != target.slot_index;
+    target.slot_index = next_slot;
+    changed
+}
+
+fn remap_midi_vst2_mixer_effect_parameter_targets_after_move(
+    mappings: &mut [MidiVst2MixerEffectParameterMapping],
+    insert_ordinal: usize,
+    from_slot: u16,
+    to_slot: u16,
+) -> bool {
+    let mut changed = false;
+    for mapping in mappings {
+        changed |= remap_midi_vst2_mixer_effect_parameter_target_after_move(
+            &mut mapping.target,
+            insert_ordinal,
+            from_slot,
+            to_slot,
+        );
+    }
+    changed
+}
+
 fn remap_pattern_vst2_mixer_effect_parameter_links_after_move(
     links: &mut [PatternVst2MixerEffectParameterLink],
     insert_ordinal: usize,
@@ -6076,6 +6117,7 @@ struct DawUi {
     midi_output_gain_mapping: Option<MidiControlChangeMapping>,
     midi_mixer_control_mappings: Vec<MidiMixerControlMapping>,
     midi_vst3_parameter_mappings: Vec<MidiVst3ParameterMapping>,
+    midi_vst2_mixer_effect_parameter_mappings: Vec<MidiVst2MixerEffectParameterMapping>,
     pattern_clap_parameter_links: Vec<PatternClapParameterLink>,
     pattern_clap_lfo_parameter_links: Vec<PatternClapLfoParameterLink>,
     pattern_clap_mixer_effect_parameter_links: Vec<PatternClapMixerEffectParameterLink>,
@@ -6095,6 +6137,7 @@ struct DawUi {
     playlist_audio_clip_envelopes: Vec<ProjectPlaylistAudioClipEnvelope>,
     playlist_automatic_crossfades: Vec<ProjectPlaylistAutomaticCrossfades>,
     midi_vst3_parameter_learning: Option<MidiVst3ParameterMappingTarget>,
+    midi_vst2_mixer_effect_parameter_learning: Option<MidiVst2MixerEffectParameterTarget>,
     midi_mixer_button_cc_active: BTreeSet<(String, u8, u8)>,
     midi_mixer_control_learning: Option<MidiMixerControlLearning>,
     midi_mixer_control_undo_snapshot: Option<Vec<u8>>,
@@ -7493,6 +7536,24 @@ struct MidiVst3ParameterMapping {
     channel: u8,
     controller: u8,
     target: MidiVst3ParameterMappingTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiVst2MixerEffectParameterTarget {
+    insert_ordinal: usize,
+    slot_index: u16,
+    plugin_path: String,
+    fourcc: String,
+    parameter_id: u32,
+    parameter_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MidiVst2MixerEffectParameterMapping {
+    input_device_id: String,
+    channel: u8,
+    controller: u8,
+    target: MidiVst2MixerEffectParameterTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9073,6 +9134,8 @@ impl DawUi {
         let midi_output_gain_mapping = load_midi_output_gain_mapping();
         let midi_mixer_control_mappings = load_midi_mixer_control_mappings();
         let midi_vst3_parameter_mappings = load_midi_vst3_parameter_mappings();
+        let midi_vst2_mixer_effect_parameter_mappings =
+            load_midi_vst2_mixer_effect_parameter_mappings();
         let vst3_manual_latency_offsets = load_vst3_manual_latency_offsets();
         let pattern_clap_parameter_links = load_pattern_clap_parameter_links();
         let pattern_clap_lfo_parameter_links = load_pattern_clap_lfo_parameter_links();
@@ -9656,6 +9719,7 @@ impl DawUi {
             midi_output_gain_mapping,
             midi_mixer_control_mappings,
             midi_vst3_parameter_mappings,
+            midi_vst2_mixer_effect_parameter_mappings,
             pattern_clap_parameter_links,
             pattern_clap_lfo_parameter_links,
             pattern_clap_mixer_effect_parameter_links,
@@ -9675,6 +9739,7 @@ impl DawUi {
             playlist_audio_clip_envelopes,
             playlist_automatic_crossfades,
             midi_vst3_parameter_learning: None,
+            midi_vst2_mixer_effect_parameter_learning: None,
             midi_mixer_button_cc_active: BTreeSet::new(),
             midi_mixer_control_learning: None,
             midi_mixer_control_undo_snapshot: None,
@@ -13233,6 +13298,11 @@ impl DawUi {
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
+        let midi_parameter_targets = self
+            .midi_vst2_mixer_effect_parameter_mappings
+            .iter()
+            .map(|mapping| (mapping.target.insert_ordinal, mapping.target.slot_index))
+            .collect::<BTreeSet<_>>();
         self.vst2_mixer_effect_parameter_snapshots
             .retain(|key, snapshot| {
                 assignments.get(key).is_some_and(|assignment| {
@@ -13255,7 +13325,9 @@ impl DawUi {
             match host.load_mixer_effect(key, assignment) {
                 Ok(()) => {
                     loaded_count += 1;
-                    if native_automation_targets.contains(&key) {
+                    if native_automation_targets.contains(&key)
+                        || midi_parameter_targets.contains(&key)
+                    {
                         match host.mixer_effect_parameters(key) {
                             Ok(parameters) => {
                                 self.vst2_mixer_effect_parameter_snapshots.insert(
@@ -13268,7 +13340,7 @@ impl DawUi {
                                 );
                             }
                             Err(error) => warnings.push(format!(
-                                "Mixer insert {} effect slot {} native Automation parameters could not be read: {error}",
+                                "Mixer insert {} effect slot {} parameters could not be read: {error}",
                                 key.0,
                                 key.1 + 1
                             )),
@@ -66344,6 +66416,9 @@ impl DawUi {
         let mut vst2_effect_editor_open = None;
         let mut capture_vst2_effect_state = None;
         let mut vst2_effect_parameters_refresh = None;
+        let mut midi_vst2_effect_parameter_learn_request = None;
+        let mut midi_vst2_effect_parameter_cancel_learning = false;
+        let mut midi_vst2_effect_parameter_remove_mapping = None;
         let mut clap_effect_editor_open = None;
         let mut inspect_clap_effect_path = None;
         let mut inspect_clap_instance = None;
@@ -66693,6 +66768,7 @@ impl DawUi {
                                                             )
                                                             .clicked()
                                                         {
+                                                            self.midi_vst2_mixer_effect_parameter_learning = None;
                                                             self.midi_output_gain_learning = false;
                                                             self.midi_play_pause_learning = false;
                                                             self.midi_mixer_control_learning =
@@ -66845,6 +66921,7 @@ impl DawUi {
                                                             )
                                                             .clicked()
                                                         {
+                                                            self.midi_vst2_mixer_effect_parameter_learning = None;
                                                             self.midi_output_gain_learning = false;
                                                             self.midi_play_pause_learning = false;
                                                             self.midi_mixer_control_learning =
@@ -66986,6 +67063,7 @@ impl DawUi {
                                                                 )
                                                                 .clicked()
                                                             {
+                                                                self.midi_vst2_mixer_effect_parameter_learning = None;
                                                                 self.midi_output_gain_learning = false;
                                                                 self.midi_play_pause_learning = false;
                                                                 self.midi_mixer_control_learning =
@@ -67315,6 +67393,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
                                     self.midi_mixer_button_cc_active.clear();
@@ -67384,6 +67463,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
                                     self.midi_mixer_button_cc_active.clear();
@@ -67455,6 +67535,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
                                     self.midi_mixer_button_cc_active.clear();
@@ -67527,6 +67608,7 @@ impl DawUi {
                                     )
                                     .clicked()
                                 {
+                                    self.midi_vst2_mixer_effect_parameter_learning = None;
                                     self.midi_output_gain_learning = false;
                                     self.midi_play_pause_learning = false;
                                     self.midi_mixer_button_cc_active.clear();
@@ -67598,6 +67680,7 @@ impl DawUi {
                                         )
                                         .clicked()
                                     {
+                                        self.midi_vst2_mixer_effect_parameter_learning = None;
                                         self.midi_output_gain_learning = false;
                                         self.midi_play_pause_learning = false;
                                         self.midi_mixer_button_cc_active.clear();
@@ -68253,6 +68336,23 @@ impl DawUi {
                                                                             && link.stream_flags == target.stream_flags
                                                                     },
                                                                 );
+                                                                let midi_target = MidiVst2MixerEffectParameterTarget {
+                                                                    insert_ordinal: insert.ordinal(),
+                                                                    slot_index: slot.slot_index(),
+                                                                    plugin_path: assignment.plugin_path.to_string_lossy().into_owned(),
+                                                                    fourcc: assignment.fourcc.clone(),
+                                                                    parameter_id: parameter.id,
+                                                                    parameter_name: parameter_name.clone(),
+                                                                };
+                                                                let midi_mapping =
+                                                                    midi_vst2_mixer_effect_parameter_mapping_for_target(
+                                                                        &self.midi_vst2_mixer_effect_parameter_mappings,
+                                                                        &midi_target,
+                                                                    );
+                                                                let midi_learning = self
+                                                                    .midi_vst2_mixer_effect_parameter_learning
+                                                                    .as_ref()
+                                                                    == Some(&midi_target);
                                                                 ui.horizontal(|ui| {
                                                                     let name = if parameter.name.is_empty() {
                                                                         "Unnamed parameter"
@@ -68265,6 +68365,35 @@ impl DawUi {
                                                                         format!("{name} ({}) · ID {}", parameter.unit, parameter.id)
                                                                     };
                                                                     ui.small(label);
+                                                                    if midi_learning {
+                                                                        if ui.small_button("Cancel learn").clicked() {
+                                                                            midi_vst2_effect_parameter_cancel_learning = true;
+                                                                        }
+                                                                    } else if ui
+                                                                        .add_enabled(
+                                                                            self.midi_input_connection.is_some(),
+                                                                            egui::Button::new(if midi_mapping.is_some() {
+                                                                                "Relearn CC"
+                                                                            } else {
+                                                                                "Learn CC"
+                                                                            }),
+                                                                        )
+                                                                        .clicked()
+                                                                    {
+                                                                        midi_vst2_effect_parameter_learn_request =
+                                                                            Some(midi_target.clone());
+                                                                    }
+                                                                    if let Some(mapping) = midi_mapping {
+                                                                        ui.small(format!(
+                                                                            "CC {} · Ch {}",
+                                                                            mapping.controller,
+                                                                            mapping.channel + 1
+                                                                        ));
+                                                                        if ui.small_button("Clear CC").clicked() {
+                                                                            midi_vst2_effect_parameter_remove_mapping =
+                                                                                Some(midi_target.clone());
+                                                                        }
+                                                                    }
                                                                     if event_linked {
                                                                         ui.small("Event linked");
                                                                     } else if let Some(target) = event_target.as_ref() {
@@ -70431,6 +70560,42 @@ impl DawUi {
                 }
             }
         }
+        if midi_vst2_effect_parameter_cancel_learning {
+            self.midi_vst2_mixer_effect_parameter_learning = None;
+            self.status = "MIDI CC learn cancelled".to_owned();
+        }
+        if let Some(target) = midi_vst2_effect_parameter_remove_mapping {
+            remove_midi_vst2_mixer_effect_parameter_mapping(
+                &mut self.midi_vst2_mixer_effect_parameter_mappings,
+                &target,
+            );
+            if self.midi_vst2_mixer_effect_parameter_learning.as_ref() == Some(&target) {
+                self.midi_vst2_mixer_effect_parameter_learning = None;
+            }
+            self.status = save_midi_vst2_mixer_effect_parameter_mappings(
+                &self.midi_vst2_mixer_effect_parameter_mappings,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared MIDI CC link for VST2 {}", target.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared VST2 MIDI CC link for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        if let Some(target) = midi_vst2_effect_parameter_learn_request {
+            self.midi_vst3_parameter_learning = None;
+            self.midi_mixer_control_learning = None;
+            self.midi_output_gain_learning = false;
+            self.midi_play_pause_learning = false;
+            self.midi_vst2_mixer_effect_parameter_learning = Some(target.clone());
+            self.status = format!(
+                "Move a MIDI CC to link it to VST2 {}",
+                target.parameter_name
+            );
+        }
         if let Some(key) = capture_vst2_effect_state {
             let Some(mut document) = self.document.as_ref().cloned() else {
                 self.status = "Open a project before capturing VST2 Mixer state".to_owned();
@@ -70583,11 +70748,35 @@ impl DawUi {
                             from_slot,
                             to_slot,
                         );
+                    let vst2_cc_mappings_changed =
+                        remap_midi_vst2_mixer_effect_parameter_targets_after_move(
+                            &mut self.midi_vst2_mixer_effect_parameter_mappings,
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
+                    if let Some(target) = self.midi_vst2_mixer_effect_parameter_learning.as_mut() {
+                        remap_midi_vst2_mixer_effect_parameter_target_after_move(
+                            target,
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
+                    }
                     let mapping_save_error = mappings_changed
                         .then(|| {
                             save_midi_vst3_parameter_mappings(&self.midi_vst3_parameter_mappings)
                         })
                         .and_then(Result::err)
+                        .or_else(|| {
+                            vst2_cc_mappings_changed
+                                .then(|| {
+                                    save_midi_vst2_mixer_effect_parameter_mappings(
+                                        &self.midi_vst2_mixer_effect_parameter_mappings,
+                                    )
+                                })
+                                .and_then(Result::err)
+                        })
                         .or(clap_assignment_save_error)
                         .or(vst2_auxiliary_map_save_error)
                         .or(vst3_auxiliary_map_save_error)
@@ -73692,6 +73881,45 @@ impl DawUi {
             return;
         };
 
+        if let Some(target) = self.midi_vst2_mixer_effect_parameter_learning.clone() {
+            let Some(connection) = self.midi_input_connection.as_ref() else {
+                self.midi_vst2_mixer_effect_parameter_learning = None;
+                self.status = "Connect a MIDI input before learning a VST2 effect parameter".into();
+                return;
+            };
+            let mapping = MidiVst2MixerEffectParameterMapping {
+                input_device_id: connection.device_id.clone(),
+                channel,
+                controller,
+                target,
+            };
+            upsert_midi_vst2_mixer_effect_parameter_mapping(
+                &mut self.midi_vst2_mixer_effect_parameter_mappings,
+                mapping.clone(),
+            );
+            self.midi_vst2_mixer_effect_parameter_learning = None;
+            let apply_error = self
+                .set_midi_vst2_mixer_effect_parameter_mapping_value(&mapping, value)
+                .err();
+            let save_error = save_midi_vst2_mixer_effect_parameter_mappings(
+                &self.midi_vst2_mixer_effect_parameter_mappings,
+            )
+            .err();
+            self.status = apply_error.or(save_error).map_or_else(
+                || {
+                    format!(
+                        "Learned MIDI CC {controller} · channel {} for VST2 {}",
+                        channel + 1,
+                        mapping.target.parameter_name
+                    )
+                },
+                |error| {
+                    format!("Learned MIDI CC, but the VST2 update or mapping save failed: {error}")
+                },
+            );
+            return;
+        }
+
         if let Some(target) = self.midi_vst3_parameter_learning.clone() {
             let Some(connection) = self.midi_input_connection.as_ref() else {
                 self.midi_vst3_parameter_learning = None;
@@ -73922,6 +74150,35 @@ impl DawUi {
         else {
             return;
         };
+        let has_vst2_mappings = !midi_vst2_mixer_effect_parameter_mappings_for_cc(
+            &self.midi_vst2_mixer_effect_parameter_mappings,
+            &input_device_id,
+            channel,
+            controller,
+        )
+        .is_empty();
+        if has_vst2_mappings {
+            match self.apply_midi_vst2_mixer_effect_parameter_control_change(
+                &input_device_id,
+                channel,
+                controller,
+                value,
+            ) {
+                Ok(applied) if applied > 0 => {
+                    self.status =
+                        format!("MIDI CC {controller} updated {applied} VST2 effect parameter(s)");
+                }
+                Ok(_) => {
+                    self.status = format!(
+                        "MIDI CC {controller} matches a VST2 effect link, but its effect is not loaded"
+                    );
+                }
+                Err(error) => {
+                    self.status =
+                        format!("Could not apply MIDI VST2 effect parameter link: {error}");
+                }
+            }
+        }
         if midi_vst3_parameter_mappings_for_cc(
             &self.midi_vst3_parameter_mappings,
             &input_device_id,
@@ -74004,6 +74261,81 @@ impl DawUi {
                 .push_str(" · MIDI script Mixer refresh callback queue is full");
         }
         Ok(true)
+    }
+
+    fn set_midi_vst2_mixer_effect_parameter_mapping_value(
+        &mut self,
+        mapping: &MidiVst2MixerEffectParameterMapping,
+        value: u8,
+    ) -> Result<bool, String> {
+        let target = &mapping.target;
+        let key = (target.insert_ordinal, target.slot_index);
+        let Some(assignment) = self.vst2_mixer_effect_assignments.get(&key) else {
+            return Ok(false);
+        };
+        if assignment.fourcc != target.fourcc
+            || assignment.plugin_path.to_string_lossy().as_ref() != target.plugin_path.as_str()
+        {
+            return Ok(false);
+        }
+        let Some(snapshot) =
+            self.vst2_mixer_effect_parameter_snapshots
+                .get(&key)
+                .filter(|snapshot| {
+                    snapshot.fourcc == target.fourcc
+                        && snapshot.plugin_path.to_string_lossy().as_ref()
+                            == target.plugin_path.as_str()
+                })
+        else {
+            return Ok(false);
+        };
+        if !snapshot.parameters.iter().any(|parameter| {
+            parameter.id == target.parameter_id && parameter.automatable && !parameter.read_only
+        }) {
+            return Ok(false);
+        }
+        let Some(runtime) = self.vst2_mixer_effect_host.as_ref().cloned() else {
+            return Ok(false);
+        };
+        runtime
+            .lock()
+            .map_err(|_| "VST2 Mixer effect editor host lock was poisoned".to_owned())?
+            .set_mixer_effect_parameter(key, target.parameter_id, f64::from(value) / 127.0)?;
+        self.dirty = true;
+        self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+        if !self.notify_midi_script_mixer_tracks_changed(
+            &[i32::try_from(target.insert_ordinal).unwrap_or(-1)],
+            SCRIPT_HW_DIRTY_CONTROL_VALUES,
+        ) {
+            self.status
+                .push_str(" · MIDI script Mixer refresh callback queue is full");
+        }
+        Ok(true)
+    }
+
+    fn apply_midi_vst2_mixer_effect_parameter_control_change(
+        &mut self,
+        input_device_id: &str,
+        channel: u8,
+        controller: u8,
+        value: u8,
+    ) -> Result<usize, String> {
+        let mappings = midi_vst2_mixer_effect_parameter_mappings_for_cc(
+            &self.midi_vst2_mixer_effect_parameter_mappings,
+            input_device_id,
+            channel,
+            controller,
+        )
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        let mut applied = 0;
+        for mapping in &mappings {
+            applied += usize::from(
+                self.set_midi_vst2_mixer_effect_parameter_mapping_value(mapping, value)?,
+            );
+        }
+        Ok(applied)
     }
 
     fn apply_midi_vst3_parameter_control_change(
@@ -79351,6 +79683,7 @@ impl DawUi {
                 self.midi_mixer_control_learning = None;
                 self.midi_play_pause_learning = false;
                 self.midi_play_pause_cc_active = false;
+                self.midi_vst2_mixer_effect_parameter_learning = None;
                 self.midi_output_gain_learning = true;
                 self.status = "Move a MIDI CC control to map output gain".to_owned();
             }
@@ -79401,6 +79734,7 @@ impl DawUi {
             {
                 self.midi_output_gain_learning = false;
                 self.midi_mixer_control_learning = None;
+                self.midi_vst2_mixer_effect_parameter_learning = None;
                 self.midi_play_pause_learning = true;
                 self.midi_play_pause_cc_active = false;
                 self.status = "Press a MIDI CC button to map Play/Pause".to_owned();
@@ -81964,6 +82298,7 @@ impl DawUi {
                 );
         }
         if let Some(target) = midi_vst3_learn_request {
+            self.midi_vst2_mixer_effect_parameter_learning = None;
             self.midi_vst3_parameter_learning = Some(target.clone());
             self.status = format!("Move a MIDI CC to link it to {}", target.parameter_name());
         }
@@ -86003,6 +86338,10 @@ fn midi_vst3_parameter_mappings_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-vst3-parameter-mappings.txt")
 }
 
+fn midi_vst2_mixer_effect_parameter_mappings_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("midi-vst2-mixer-effect-parameter-mappings.txt")
+}
+
 fn pattern_vst3_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst3-parameter-links.txt")
 }
@@ -86112,6 +86451,13 @@ fn load_midi_vst3_parameter_mappings() -> Vec<MidiVst3ParameterMapping> {
     midi_vst3_parameter_mappings_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_midi_vst3_parameter_mappings(&contents))
+        .unwrap_or_default()
+}
+
+fn load_midi_vst2_mixer_effect_parameter_mappings() -> Vec<MidiVst2MixerEffectParameterMapping> {
+    midi_vst2_mixer_effect_parameter_mappings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_midi_vst2_mixer_effect_parameter_mappings(&contents))
         .unwrap_or_default()
 }
 
@@ -86456,6 +86802,23 @@ fn save_midi_vst3_parameter_mappings(mappings: &[MidiVst3ParameterMapping]) -> R
         .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
     fs::write(&path, serialize_midi_vst3_parameter_mappings(mappings))
         .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_midi_vst2_mixer_effect_parameter_mappings(
+    mappings: &[MidiVst2MixerEffectParameterMapping],
+) -> Result<(), String> {
+    let path = midi_vst2_mixer_effect_parameter_mappings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the VST2 Mixer parameter mapping path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(
+        &path,
+        serialize_midi_vst2_mixer_effect_parameter_mappings(mappings),
+    )
+    .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_pattern_vst3_parameter_links(links: &[PatternVst3ParameterLink]) -> Result<(), String> {
@@ -86873,6 +87236,169 @@ fn midi_vst3_parameter_mappings_for_cc<'a>(
                 && mapping.controller == controller
         })
         .collect()
+}
+
+fn valid_midi_vst2_mixer_effect_parameter_mapping(
+    mapping: &MidiVst2MixerEffectParameterMapping,
+) -> bool {
+    !mapping.input_device_id.is_empty()
+        && mapping.channel < 16
+        && mapping.controller < 128
+        && mapping.target.insert_ordinal <= 127
+        && mapping.target.slot_index < 10
+        && !mapping.target.plugin_path.is_empty()
+        && mapping.target.fourcc.len() == 4
+        && mapping.target.fourcc.is_ascii()
+        && !mapping.target.parameter_name.is_empty()
+}
+
+fn same_midi_vst2_mixer_effect_parameter_target(
+    left: &MidiVst2MixerEffectParameterTarget,
+    right: &MidiVst2MixerEffectParameterTarget,
+) -> bool {
+    left.insert_ordinal == right.insert_ordinal
+        && left.slot_index == right.slot_index
+        && left.plugin_path == right.plugin_path
+        && left.fourcc == right.fourcc
+        && left.parameter_id == right.parameter_id
+}
+
+fn upsert_midi_vst2_mixer_effect_parameter_mapping(
+    mappings: &mut Vec<MidiVst2MixerEffectParameterMapping>,
+    mapping: MidiVst2MixerEffectParameterMapping,
+) {
+    if !valid_midi_vst2_mixer_effect_parameter_mapping(&mapping) {
+        return;
+    }
+    mappings.retain(|existing| {
+        !same_midi_vst2_mixer_effect_parameter_target(&existing.target, &mapping.target)
+    });
+    mappings.push(mapping);
+}
+
+fn remove_midi_vst2_mixer_effect_parameter_mapping(
+    mappings: &mut Vec<MidiVst2MixerEffectParameterMapping>,
+    target: &MidiVst2MixerEffectParameterTarget,
+) {
+    mappings
+        .retain(|mapping| !same_midi_vst2_mixer_effect_parameter_target(&mapping.target, target));
+}
+
+fn midi_vst2_mixer_effect_parameter_mapping_for_target<'a>(
+    mappings: &'a [MidiVst2MixerEffectParameterMapping],
+    target: &MidiVst2MixerEffectParameterTarget,
+) -> Option<&'a MidiVst2MixerEffectParameterMapping> {
+    mappings
+        .iter()
+        .find(|mapping| same_midi_vst2_mixer_effect_parameter_target(&mapping.target, target))
+}
+
+fn midi_vst2_mixer_effect_parameter_mappings_for_cc<'a>(
+    mappings: &'a [MidiVst2MixerEffectParameterMapping],
+    input_device_id: &str,
+    channel: u8,
+    controller: u8,
+) -> Vec<&'a MidiVst2MixerEffectParameterMapping> {
+    mappings
+        .iter()
+        .filter(|mapping| {
+            mapping.input_device_id == input_device_id
+                && mapping.channel == channel
+                && mapping.controller == controller
+        })
+        .collect()
+}
+
+fn parse_midi_vst2_mixer_effect_parameter_mappings(
+    contents: &str,
+) -> Vec<MidiVst2MixerEffectParameterMapping> {
+    let mut mappings = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("mapping=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(input_device_id) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(controller) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(insert_ordinal) = fields.next().and_then(|field| field.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        let Some(slot_index) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(fourcc) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_midi_vst2_mixer_effect_parameter_mapping(
+            &mut mappings,
+            MidiVst2MixerEffectParameterMapping {
+                input_device_id,
+                channel,
+                controller,
+                target: MidiVst2MixerEffectParameterTarget {
+                    insert_ordinal,
+                    slot_index,
+                    plugin_path,
+                    fourcc,
+                    parameter_id,
+                    parameter_name,
+                },
+            },
+        );
+    }
+    mappings
+}
+
+fn serialize_midi_vst2_mixer_effect_parameter_mappings(
+    mappings: &[MidiVst2MixerEffectParameterMapping],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for mapping in mappings {
+        upsert_midi_vst2_mixer_effect_parameter_mapping(&mut normalized, mapping.clone());
+    }
+    for mapping in normalized {
+        contents.push_str("mapping=");
+        contents.push_str(&encode_midi_device_id(&mapping.input_device_id));
+        contents.push('\t');
+        contents.push_str(&mapping.channel.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.controller.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.target.insert_ordinal.to_string());
+        contents.push('\t');
+        contents.push_str(&mapping.target.slot_index.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&mapping.target.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&mapping.target.fourcc));
+        contents.push('\t');
+        contents.push_str(&mapping.target.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&mapping.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
 }
 
 fn parse_midi_vst3_parameter_mappings(contents: &str) -> Vec<MidiVst3ParameterMapping> {
