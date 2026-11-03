@@ -1022,7 +1022,7 @@ def _mixer_get_track_info(mode):
         track_names = _active_transport_state.get("mixer_track_names", [])
         return max(1, len(track_names) - 1)
     if mode == 3:  # midi.TN_Sel
-        return int(_active_transport_state.get("mixer_selected_track", 0))
+        return _mixer_track_count() - 1
     raise ValueError("Mixer track info mode must be a midi.TN_* constant")
 
 
