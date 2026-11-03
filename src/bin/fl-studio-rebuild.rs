@@ -67097,8 +67097,8 @@ impl DawUi {
                     .map(|location| (location, (slot.insert_ordinal(), slot.slot_index())))
             })
             .collect::<HashMap<_, _>>();
-        let mut live_master_fader_gain_edit = None;
-        let mut live_mixer_insert_fader_edit = None;
+        let mut live_master_fader_gain_edits = Vec::new();
+        let mut live_mixer_insert_fader_edits = Vec::new();
         let mut live_mixer_insert_pan_edit = None;
         let mut live_mixer_insert_stereo_separation_edit = None;
         let mut live_master_pan_edit = None;
@@ -67559,7 +67559,7 @@ impl DawUi {
                                                         ui.small("LEVEL · RAW");
                                                         let mut volume_value = volume_record.value();
                                                         if (0..=16_000).contains(&volume_value) {
-                                                            if ui
+                                                            let fader_response = ui
                                                                 .add_sized(
                                                                     [28.0, fader_height],
                                                                     egui::Slider::new(
@@ -67570,16 +67570,20 @@ impl DawUi {
                                                                     .show_value(false)
                                                                     .step_by(1.0),
                                                                 )
-                                                                .changed()
-                                                            {
+                                                                .on_hover_text(
+                                                                    "Drag to adjust this Mixer fader. When this insert is selected with others, the same raw change is applied to each selected insert with a supported fader.",
+                                                                );
+                                                            if fader_response.changed() {
+                                                                let volume_delta =
+                                                                    volume_value - volume_record.value();
                                                                 parameter_edits.push((
                                                                     volume_record.event_index(),
                                                                     volume_record.record_index(),
                                                                     volume_value,
                                                                 ));
                                                                 if insert.ordinal() == 0 {
-                                                                    live_master_fader_gain_edit =
-                                                                        Some((
+                                                                    live_master_fader_gain_edits
+                                                                        .push((
                                                                             volume_record
                                                                                 .event_index(),
                                                                             volume_record
@@ -67588,8 +67592,8 @@ impl DawUi {
                                                                                 / 10_000.0,
                                                                         ));
                                                                 } else {
-                                                                    live_mixer_insert_fader_edit =
-                                                                        Some((
+                                                                    live_mixer_insert_fader_edits
+                                                                        .push((
                                                                             insert.ordinal(),
                                                                             volume_record
                                                                                 .event_index(),
@@ -67597,6 +67601,81 @@ impl DawUi {
                                                                                 .record_index(),
                                                                             volume_value,
                                                                         ));
+                                                                }
+                                                                if volume_delta != 0
+                                                                    && self
+                                                                        .selected_mixer_inserts
+                                                                        .contains(&insert.ordinal())
+                                                                    && self
+                                                                        .selected_mixer_inserts
+                                                                        .len()
+                                                                        > 1
+                                                                {
+                                                                    for selected_ordinal in self
+                                                                        .selected_mixer_inserts
+                                                                        .iter()
+                                                                        .copied()
+                                                                        .filter(|ordinal| {
+                                                                            *ordinal
+                                                                                != insert.ordinal()
+                                                                        })
+                                                                    {
+                                                                        let Some((
+                                                                            selected_volume,
+                                                                            _,
+                                                                        )) = candidate_mixer_controls(
+                                                                            &parameters,
+                                                                            selected_ordinal,
+                                                                        ) else {
+                                                                            continue;
+                                                                        };
+                                                                        let selected_value =
+                                                                            selected_volume
+                                                                                .value();
+                                                                        if !(0..=16_000)
+                                                                            .contains(&selected_value)
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        let grouped_value =
+                                                                            (selected_value
+                                                                                + volume_delta)
+                                                                                .clamp(0, 16_000);
+                                                                        if grouped_value
+                                                                            == selected_value
+                                                                        {
+                                                                            continue;
+                                                                        }
+                                                                        parameter_edits.push((
+                                                                            selected_volume
+                                                                                .event_index(),
+                                                                            selected_volume
+                                                                                .record_index(),
+                                                                            grouped_value,
+                                                                        ));
+                                                                        if selected_ordinal == 0 {
+                                                                            live_master_fader_gain_edits
+                                                                                .push((
+                                                                                    selected_volume
+                                                                                        .event_index(),
+                                                                                    selected_volume
+                                                                                        .record_index(),
+                                                                                    grouped_value
+                                                                                        as f32
+                                                                                        / 10_000.0,
+                                                                                ));
+                                                                        } else {
+                                                                            live_mixer_insert_fader_edits
+                                                                                .push((
+                                                                                    selected_ordinal,
+                                                                                    selected_volume
+                                                                                        .event_index(),
+                                                                                    selected_volume
+                                                                                        .record_index(),
+                                                                                    grouped_value,
+                                                                                ));
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
                                                             ui.small(volume_value.to_string());
@@ -70416,8 +70495,8 @@ impl DawUi {
         if !parameter_edits.is_empty()
             && let Some(document) = self.document.as_mut()
         {
-            let mut applied_live_master_fader_gain = None;
-            let mut applied_live_mixer_insert_fader_raw = None;
+            let mut applied_live_master_fader_gains = Vec::new();
+            let mut applied_live_mixer_insert_fader_raw = Vec::new();
             let mut applied_live_mixer_insert_pan_raw = None;
             let mut applied_live_mixer_insert_stereo_separation_raw = None;
             let mut applied_live_master_pan = None;
@@ -70484,19 +70563,20 @@ impl DawUi {
                                 value,
                             ));
                         }
-                        if let Some((master_event, master_record, gain)) =
-                            live_master_fader_gain_edit
-                            && master_event == event_index
-                            && master_record == record_index
-                        {
-                            applied_live_master_fader_gain = Some(gain);
+                        if let Some((_, _, gain)) = live_master_fader_gain_edits.iter().find(
+                            |(master_event, master_record, _)| {
+                                *master_event == event_index && *master_record == record_index
+                            },
+                        ) {
+                            applied_live_master_fader_gains.push(*gain);
                         }
-                        if let Some((track, insert_event, insert_record, volume_raw)) =
-                            live_mixer_insert_fader_edit
-                            && insert_event == event_index
-                            && insert_record == record_index
+                        if let Some((track, _, _, volume_raw)) = live_mixer_insert_fader_edits
+                            .iter()
+                            .find(|(_, insert_event, insert_record, _)| {
+                                *insert_event == event_index && *insert_record == record_index
+                            })
                         {
-                            applied_live_mixer_insert_fader_raw = Some((track, volume_raw));
+                            applied_live_mixer_insert_fader_raw.push((*track, *volume_raw));
                         }
                         if let Some((track, insert_event, insert_record, pan_raw)) =
                             live_mixer_insert_pan_edit
@@ -70537,11 +70617,11 @@ impl DawUi {
                     }
                 }
             }
-            if let Some(gain) = applied_live_master_fader_gain {
+            for gain in applied_live_master_fader_gains {
                 self.mixer_track_peak_meters
                     .set_live_master_fader_gain(gain);
             }
-            if let Some((track, volume_raw)) = applied_live_mixer_insert_fader_raw {
+            for (track, volume_raw) in applied_live_mixer_insert_fader_raw {
                 self.mixer_track_peak_meters
                     .set_live_mixer_insert_fader_raw(track, Some(volume_raw));
             }
