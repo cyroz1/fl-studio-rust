@@ -67268,8 +67268,10 @@ impl DawUi {
                                                         .take(range_end - range_start + 1)
                                                         .map(MixerInsertSummary::ordinal)
                                                         .collect();
-                                                    self.selected_mixer_insert =
-                                                        Some(insert.ordinal());
+                                                    self.selected_mixer_insert = self
+                                                        .selected_mixer_inserts
+                                                        .first()
+                                                        .copied();
                                                 }
                                                 if track_button.clicked()
                                                     && !self.mixer_drag_select_moved

@@ -889,6 +889,8 @@ def _mixer_track_index(index):
         raise ValueError("mixer track index must be an integer") from error
     if not 0 <= index <= 65535:
         raise IndexError("mixer track index is outside the supported range")
+    if index == _mixer_track_count() - 1:
+        return _mixer_track_number()
     return index
 
 
@@ -981,9 +983,6 @@ def _mixer_get_track_peaks(index, mode):
     if mode not in (0, 1, 2):
         raise ValueError("Mixer peak mode must be PEAK_L, PEAK_R, or PEAK_LR")
     peaks = _active_transport_state.get("mixer_track_peaks", [])
-    current_track_index = _mixer_track_count() - 1
-    if index == current_track_index:
-        index = int(_active_transport_state.get("mixer_selected_track", 0))
     if index >= len(peaks):
         return 0.0
     try:
