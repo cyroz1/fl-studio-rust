@@ -44765,7 +44765,7 @@ impl DawUi {
                         });
                         if !zipped && loaded_vst2_channels.contains(&channel.id()) {
                             ui.collapsing("VST2 MIDI parameters", |ui| {
-                                ui.small("MIDI changes are live; use Capture state to save plug-in values into the project.");
+                                ui.small("MIDI changes are live; project saves capture loaded VST2 state. Use Capture state to snapshot it immediately.");
                                 if ui.small_button("Refresh parameters").clicked() {
                                     vst2_channel_parameters_refresh = Some(channel.id());
                                 }
