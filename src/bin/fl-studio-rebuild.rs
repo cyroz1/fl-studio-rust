@@ -6835,10 +6835,10 @@ fn vst3_playlist_midi_event(event: Vst3LiveInputEvent) -> Option<Vst3MidiEvent> 
             note: key.min(127),
             velocity: velocity.min(127),
         },
-        Vst3LiveInputEvent::NoteOff { key, .. } => Vst3MidiEvent::NoteOff {
+        Vst3LiveInputEvent::NoteOff { key, velocity, .. } => Vst3MidiEvent::NoteOff {
             channel,
             note: key.min(127),
-            velocity: 0,
+            velocity: velocity.min(127),
         },
         Vst3LiveInputEvent::ControlChange {
             controller, value, ..
@@ -76679,8 +76679,16 @@ impl DawUi {
                 }));
                 mapped_note_on = Some(((channel & 0x0F, key.min(127)), audition_key));
             }
-            MidiInputEvent::NoteOn { channel, key, .. }
-            | MidiInputEvent::NoteOff { channel, key, .. } => {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            }
+            | MidiInputEvent::NoteOff {
+                channel,
+                key,
+                velocity,
+            } => {
                 if self.live_layer_input.is_none() {
                     return true;
                 }
@@ -76700,6 +76708,7 @@ impl DawUi {
                 queued_events.push(LayerLiveInputEvent::Midi(Vst3LiveInputEvent::NoteOff {
                     channel,
                     key: mapped_key,
+                    velocity,
                 }));
             }
             MidiInputEvent::ControlChange {
@@ -77269,8 +77278,16 @@ impl DawUi {
                     Some(layer_adjustments),
                 )
             }
-            MidiInputEvent::NoteOn { channel, key, .. }
-            | MidiInputEvent::NoteOff { channel, key, .. } => {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            }
+            | MidiInputEvent::NoteOff {
+                channel,
+                key,
+                velocity,
+            } => {
                 let source_note = (channel & 0x0F, key.min(127));
                 let mapped_key = self
                     .midi_live_vst3_note_mapping
@@ -77307,6 +77324,7 @@ impl DawUi {
                     Vst3LiveInputEvent::NoteOff {
                         channel,
                         key: mapped_key,
+                        velocity,
                     },
                     None,
                     Some(targets),
@@ -77543,8 +77561,16 @@ impl DawUi {
                     Some((source_note, Some(audition_key))),
                 )
             }
-            MidiInputEvent::NoteOn { channel, key, .. }
-            | MidiInputEvent::NoteOff { channel, key, .. } => {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            }
+            | MidiInputEvent::NoteOff {
+                channel,
+                key,
+                velocity,
+            } => {
                 let source_note = (channel & 0x0F, key.min(127));
                 let mapped_key = self
                     .midi_live_vst3_note_mapping
@@ -77571,6 +77597,7 @@ impl DawUi {
                     Vst3LiveInputEvent::NoteOff {
                         channel,
                         key: mapped_key,
+                        velocity,
                     },
                     None,
                 )
@@ -77846,8 +77873,16 @@ impl DawUi {
                     Some((source_note, Some(audition_key))),
                 )
             }
-            MidiInputEvent::NoteOn { channel, key, .. }
-            | MidiInputEvent::NoteOff { channel, key, .. } => {
+            MidiInputEvent::NoteOn {
+                channel,
+                key,
+                velocity,
+            }
+            | MidiInputEvent::NoteOff {
+                channel,
+                key,
+                velocity,
+            } => {
                 let source_note = (channel & 0x0F, key.min(127));
                 let mapped_key = self
                     .midi_live_vst2_note_mapping
@@ -77867,6 +77902,7 @@ impl DawUi {
                     Vst3LiveInputEvent::NoteOff {
                         channel,
                         key: mapped_key,
+                        velocity,
                     },
                     None,
                 )

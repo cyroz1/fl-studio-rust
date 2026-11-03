@@ -1105,6 +1105,7 @@ pub enum Vst3LiveInputEvent {
     NoteOff {
         channel: u8,
         key: u8,
+        velocity: u8,
     },
     ControlChange {
         channel: u8,
@@ -9640,6 +9641,10 @@ impl Vst2PatternStreamProcessor {
             .iter_mut()
             .find(|channel| channel.info.channel_id == channel_id)
             .ok_or_else(|| format!("VST2 channel {channel_id} is not available for live input"))?;
+        let note_off_velocity = match event {
+            Vst3LiveInputEvent::NoteOff { velocity, .. } => velocity.min(127),
+            _ => 0,
+        };
         match event {
             Vst3LiveInputEvent::NoteOn {
                 channel: midi_channel,
@@ -9679,6 +9684,7 @@ impl Vst2PatternStreamProcessor {
             | Vst3LiveInputEvent::NoteOff {
                 channel: midi_channel,
                 key,
+                ..
             } => {
                 let source_note = (midi_channel & 0x0F, key.min(127));
                 let rendered_key = channel
@@ -9697,7 +9703,11 @@ impl Vst2PatternStreamProcessor {
                         frame,
                         Vst2PendingMidiEvent {
                             priority: 0,
-                            data: [0x80 | (midi_channel & 0x0F), rendered_key, 0],
+                            data: [
+                                0x80 | (midi_channel & 0x0F),
+                                rendered_key,
+                                note_off_velocity,
+                            ],
                         },
                     );
                 }
@@ -12356,7 +12366,12 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                 .push_back(active_targets);
                         }
                         Ok(Vst2LiveInputEvent {
-                            midi: Vst3LiveInputEvent::NoteOff { channel, key },
+                            midi:
+                                Vst3LiveInputEvent::NoteOff {
+                                    channel,
+                                    key,
+                                    velocity,
+                                },
                             ..
                         }) => {
                             let source_note = (channel & 0x0F, key.min(127));
@@ -12380,6 +12395,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                                         Vst3LiveInputEvent::NoteOff {
                                             channel,
                                             key: source_note.1,
+                                            velocity,
                                         },
                                     )?;
                                 }
@@ -13412,7 +13428,11 @@ pub fn stream_mixed_layer_midi_input_to_device(
                             .or_default()
                             .push_back(active_targets);
                     }
-                    Ok(LayerLiveInputEvent::Midi(Vst3LiveInputEvent::NoteOff { channel, key })) => {
+                    Ok(LayerLiveInputEvent::Midi(Vst3LiveInputEvent::NoteOff {
+                        channel,
+                        key,
+                        velocity,
+                    })) => {
                         let source_note = (channel & 0x0F, key.min(127));
                         let active_targets = note_targets
                             .get_mut(&source_note)
@@ -13442,7 +13462,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                                 "VST3 Layer processor is unavailable".to_owned()
                                             })?
                                             .schedule_live_input_note_off(
-                                                channel_id, channel, key, note_id,
+                                                channel_id, channel, key, velocity, note_id,
                                             )?;
                                     }
                                     LiveLayerNoteDestination::Vst2 { channel_id } => {
@@ -13457,6 +13477,7 @@ pub fn stream_mixed_layer_midi_input_to_device(
                                                 Vst3LiveInputEvent::NoteOff {
                                                     channel,
                                                     key: key.min(127),
+                                                    velocity,
                                                 },
                                             )?;
                                     }
@@ -13788,7 +13809,11 @@ pub fn stream_vst3_midi_input_to_device(
                             .or_default()
                             .push_back(active_targets);
                     }
-                    Ok(Vst3LiveInputEvent::NoteOff { channel, key }) => {
+                    Ok(Vst3LiveInputEvent::NoteOff {
+                        channel,
+                        key,
+                        velocity,
+                    }) => {
                         let source_note = (channel & 0x0F, key.min(127));
                         let active_note =
                             note_ids.get_mut(&source_note).and_then(VecDeque::pop_front);
@@ -13801,6 +13826,7 @@ pub fn stream_vst3_midi_input_to_device(
                                     target_channel_id,
                                     channel,
                                     rendered_key,
+                                    velocity,
                                     note_id,
                                 )?;
                             }
@@ -14058,7 +14084,12 @@ pub fn stream_vst2_midi_input_to_device(
                             .push_back(active_targets);
                     }
                     Ok(Vst2LiveInputEvent {
-                        midi: Vst3LiveInputEvent::NoteOff { channel, key },
+                        midi:
+                            Vst3LiveInputEvent::NoteOff {
+                                channel,
+                                key,
+                                velocity,
+                            },
                         ..
                     }) => {
                         let source_note = (channel & 0x0F, key.min(127));
@@ -14079,6 +14110,7 @@ pub fn stream_vst2_midi_input_to_device(
                                     Vst3LiveInputEvent::NoteOff {
                                         channel,
                                         key: source_note.1,
+                                        velocity,
                                     },
                                 )?;
                             }

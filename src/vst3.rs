@@ -17,6 +17,7 @@ use crate::audio::{
     MixerTrackPeakMeters, StereoFrameDelay, StreamingAudioWriter, mixer_effect_wet_mix,
 };
 use crate::media::DecodedAudio;
+use crate::midi::midi_release_velocity_to_fl_note_release;
 use crate::plugin_settings::Vst3MixerEffectAuxiliaryMapKey;
 use crate::sample_render::{
     AudioFileRenderOptions, PlaylistPatternScheduleOptions, PlaylistRenderOptions,
@@ -1682,6 +1683,7 @@ impl Vst3PlaylistStreamProcessor {
         channel_id: u16,
         midi_channel: u8,
         key: u8,
+        velocity: u8,
         note_id: i32,
     ) -> Result<(), String> {
         let midi_channel = MidiChannel::from_index(midi_channel & 0x0F)
@@ -1707,7 +1709,7 @@ impl Vst3PlaylistStreamProcessor {
                 note_pan: 64,
                 note_mod_x: 128,
                 note_mod_y: 128,
-                note_release: 64,
+                note_release: midi_release_velocity_to_fl_note_release(velocity),
                 layer_gain: 1.0,
                 layer_pan_raw: 0,
                 performance_track_id: Some(LIVE_VST3_INPUT_TRACK_ID),
