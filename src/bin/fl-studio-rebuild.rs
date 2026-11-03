@@ -42282,6 +42282,7 @@ impl DawUi {
                             && matching.next().is_none()
                     })
             );
+        let pattern_clip_source_window = playlist_pattern_clip_resize_ticks(clip).is_some();
         let mut start_offset = clip.start_offset;
         let mut end_offset = clip.end_offset;
         let (mut source_start_tick, mut source_end_tick) =
@@ -42311,7 +42312,13 @@ impl DawUi {
             length_changed = ui
                 .add_enabled(
                     clip.can_resize_timeline_length(),
-                    egui::DragValue::new(&mut length).speed(1.0),
+                    egui::DragValue::new(&mut length).speed(1.0).range(
+                        if pattern_clip_source_window {
+                            1..=u32::MAX.saturating_sub(source_start_tick)
+                        } else {
+                            0..=u32::MAX
+                        },
+                    ),
                 )
                 .changed();
             duplicate_requested = ui.button("Duplicate after").clicked();
@@ -42403,18 +42410,51 @@ impl DawUi {
                     ui.small(
                         "Candidate tick bounds map at the project base tempo; clip stretch and tempo automation are unsupported.",
                     );
+                } else if pattern_clip_source_window {
+                    ui.horizontal_wrapped(|ui| {
+                        source_start_tick_changed = ui
+                            .add(
+                                egui::DragValue::new(&mut source_start_tick)
+                                    .range(0..=u32::MAX.saturating_sub(length))
+                                    .prefix("Source start tick ")
+                                    .speed(1.0),
+                            )
+                            .changed();
+                        source_end_tick = source_start_tick.saturating_add(length);
+                        ui.label(format!("Source end tick {source_end_tick}"));
+                    });
+                    ui.small(
+                        "Changing the source start shifts the one-to-one Pattern window; its end follows the clip length.",
+                    );
                 } else if let Some((start, end)) = clip.source_window_ticks() {
                     ui.label(format!("Source cut window: {start}–{end} ticks (decoded)"));
                 }
-                ui.label("Other clip data is preserved; audio fades, gain, and stretch scale are not decoded yet");
+                if audio_clip_source_window {
+                    ui.label("Other clip data is preserved; audio fades, gain, and stretch scale are not decoded yet");
+                } else if pattern_clip_source_window {
+                    ui.label("Other Pattern Clip data is preserved; its scale and raw flags remain opaque");
+                } else {
+                    ui.label("Other clip data is preserved; this record's fields remain opaque");
+                }
             }
         });
-        let source_window_ticks_changed = source_start_tick_changed || source_end_tick_changed;
-        let source_window_ticks_valid =
-            !source_window_ticks_changed || source_start_tick < source_end_tick;
+        let source_window_ticks_changed = source_start_tick_changed
+            || source_end_tick_changed
+            || (pattern_clip_source_window && length_changed);
+        if pattern_clip_source_window && source_window_ticks_changed {
+            source_end_tick = source_start_tick.saturating_add(length);
+        }
+        let source_window_ticks_valid = !source_window_ticks_changed
+            || (source_start_tick < source_end_tick
+                && (!pattern_clip_source_window
+                    || source_end_tick.checked_sub(source_start_tick) == Some(length)));
         let mut clip_edit_succeeded = source_window_ticks_valid;
         if !source_window_ticks_valid {
-            self.status = "Audio Clip source end tick must be after its start tick".to_owned();
+            self.status = if pattern_clip_source_window {
+                "Pattern Clip source window must match its timeline length".to_owned()
+            } else {
+                "Audio Clip source end tick must be after its start tick".to_owned()
+            };
         }
         if source_window_ticks_valid
             && (position_changed
