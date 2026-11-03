@@ -67112,7 +67112,7 @@ impl DawUi {
         let mut load_insert_state = None;
         let mut save_insert_state = None;
         let mut save_native_effect_state = None;
-        let mut effect_slot_move = None;
+        let mut effect_slot_moves = Vec::new();
         let mut effect_editor_open = None;
         let mut vst2_effect_editor_open = None;
         let mut capture_vst2_effect_state = None;
@@ -69181,22 +69181,42 @@ impl DawUi {
                                                     clap_effect_editor_open = Some(slot_key);
                                                 }
                                                 if slot_index > 0
-                                                    && ui.small_button("Move up").clicked()
+                                                    && ui
+                                                        .small_button("Move up")
+                                                        .on_hover_text("Moves this slot and matching selected effect slots up one position.")
+                                                        .clicked()
                                                 {
-                                                    effect_slot_move = Some((
+                                                    effect_slot_moves.push((
                                                         insert.ordinal(),
                                                         slot_index as u16,
                                                         (slot_index - 1) as u16,
                                                     ));
+                                                    for selected_slot in &grouped_effect_slots {
+                                                        effect_slot_moves.push((
+                                                            selected_slot.insert_ordinal(),
+                                                            selected_slot.slot_index(),
+                                                            (slot_index - 1) as u16,
+                                                        ));
+                                                    }
                                                 }
                                                 if slot_index < 9
-                                                    && ui.small_button("Move down").clicked()
+                                                    && ui
+                                                        .small_button("Move down")
+                                                        .on_hover_text("Moves this slot and matching selected effect slots down one position.")
+                                                        .clicked()
                                                 {
-                                                    effect_slot_move = Some((
+                                                    effect_slot_moves.push((
                                                         insert.ordinal(),
                                                         slot_index as u16,
                                                         (slot_index + 1) as u16,
                                                     ));
+                                                    for selected_slot in &grouped_effect_slots {
+                                                        effect_slot_moves.push((
+                                                            selected_slot.insert_ordinal(),
+                                                            selected_slot.slot_index(),
+                                                            (slot_index + 1) as u16,
+                                                        ));
+                                                    }
                                                 }
                                             });
                                             if vst2_editor_loaded
@@ -70393,8 +70413,8 @@ impl DawUi {
                                     && payload.0 == insert.ordinal()
                                     && payload.1 != slot_index_raw
                                 {
-                                    effect_slot_move =
-                                        Some((insert.ordinal(), payload.1, slot_index_raw));
+                                    effect_slot_moves
+                                        .push((insert.ordinal(), payload.1, slot_index_raw));
                                 }
                                 response.response.on_hover_text(format!(
                                     "{} · {} · {} preserved slot events",
@@ -71646,16 +71666,37 @@ impl DawUi {
                 }
             }
         }
-        if let Some((insert_ordinal, from_slot, to_slot)) = effect_slot_move
+        if !effect_slot_moves.is_empty()
             && let Some(document) = self.document.as_mut()
         {
-            match document.move_mixer_effect_slot(insert_ordinal, from_slot, to_slot) {
-                Ok(()) => {
+            let move_count = effect_slot_moves.len();
+            let first_move = effect_slot_moves[0];
+            let mut candidate = document.clone();
+            let mut move_error = None;
+            for &(insert_ordinal, from_slot, to_slot) in &effect_slot_moves {
+                if let Err(error) =
+                    candidate.move_mixer_effect_slot(insert_ordinal, from_slot, to_slot)
+                {
+                    move_error = Some(error);
+                    break;
+                }
+            }
+            if let Some(error) = move_error {
+                self.status = format!("Could not move Mixer effect slots: {error}");
+            } else {
+                *document = candidate;
+                mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_DISPLAY
+                    | SCRIPT_HW_DIRTY_MIXER_CONTROLS
+                    | SCRIPT_HW_DIRTY_CONTROL_VALUES
+                    | SCRIPT_HW_DIRTY_NAMES;
+                let mut pattern_event_links_changed = false;
+                let mut playlist_automation_links_changed = false;
+                let mut pattern_lfo_links_changed = false;
+                let mut playlist_lfo_links_changed = false;
+                let mut mappings_changed = false;
+                let mut vst2_cc_mappings_changed = false;
+                for &(insert_ordinal, from_slot, to_slot) in &effect_slot_moves {
                     dirty_mixer_tracks.insert(i32::try_from(insert_ordinal).unwrap_or(-1));
-                    mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_DISPLAY
-                        | SCRIPT_HW_DIRTY_MIXER_CONTROLS
-                        | SCRIPT_HW_DIRTY_CONTROL_VALUES
-                        | SCRIPT_HW_DIRTY_NAMES;
                     remap_mixer_effect_instances_after_move(
                         &mut self.mixer_effect_vst3_instances,
                         insert_ordinal,
@@ -71686,28 +71727,28 @@ impl DawUi {
                         from_slot,
                         to_slot,
                     );
-                    let pattern_event_links_changed =
+                    pattern_event_links_changed |=
                         remap_pattern_vst2_mixer_effect_parameter_links_after_move(
                             &mut self.pattern_vst2_mixer_effect_parameter_links,
                             insert_ordinal,
                             from_slot,
                             to_slot,
                         );
-                    let playlist_automation_links_changed =
+                    playlist_automation_links_changed |=
                         remap_playlist_vst2_mixer_effect_parameter_links_after_move(
                             &mut self.playlist_vst2_mixer_effect_parameter_links,
                             insert_ordinal,
                             from_slot,
                             to_slot,
                         );
-                    let pattern_lfo_links_changed =
+                    pattern_lfo_links_changed |=
                         remap_pattern_vst2_mixer_effect_lfo_parameter_links_after_move(
                             &mut self.pattern_vst2_mixer_effect_lfo_parameter_links,
                             insert_ordinal,
                             from_slot,
                             to_slot,
                         );
-                    let playlist_lfo_links_changed =
+                    playlist_lfo_links_changed |=
                         remap_playlist_vst2_mixer_effect_lfo_parameter_links_after_move(
                             &mut self.playlist_vst2_mixer_effect_lfo_parameter_links,
                             insert_ordinal,
@@ -71723,55 +71764,13 @@ impl DawUi {
                             to_slot,
                         );
                     }
-                    let clap_assignment_save_error = project_id.as_deref().and_then(|project_id| {
-                        save_clap_project_mixer_effects(
-                            project_id,
-                            &self.clap_mixer_effect_assignments,
-                        )
-                        .err()
-                    });
-                    let vst2_auxiliary_map_save_error =
-                        project_id.as_deref().and_then(|project_id| {
-                            let mut mappings = load_vst2_project_mixer_auxiliary_maps(project_id);
-                            remap_vst2_mixer_auxiliary_maps_after_move(
-                                &mut mappings,
-                                insert_ordinal,
-                                from_slot,
-                                to_slot,
-                            );
-                            save_vst2_project_mixer_auxiliary_maps(project_id, &mappings).err()
-                        });
-                    let vst3_auxiliary_map_save_error =
-                        project_id.as_deref().and_then(|project_id| {
-                            let mut mappings = load_vst3_project_mixer_auxiliary_maps(project_id);
-                            remap_vst3_mixer_auxiliary_maps_after_move(
-                                &mut mappings,
-                                insert_ordinal,
-                                from_slot,
-                                to_slot,
-                            );
-                            save_vst3_project_mixer_auxiliary_maps(project_id, &mappings).err()
-                        });
-                    let factory = combined_mixer_effect_processor_factory(
-                        self.clap_mixer_effect_assignments.clone(),
-                        self.vst2_mixer_effect_assignments.clone(),
-                        self.vst2_mixer_effect_parameter_sync.clone(),
-                        self.clap_mixer_effect_state_capture_controller.clone(),
+                    mappings_changed |= remap_midi_vst3_mixer_effect_parameter_targets_after_move(
+                        &mut self.midi_vst3_parameter_mappings,
+                        insert_ordinal,
+                        from_slot,
+                        to_slot,
                     );
-                    if let Some(host) = &mut self.vst3_host {
-                        host.set_mixer_effect_processor_factory(factory);
-                        host.set_mixer_effect_auxiliary_input_source_maps(
-                            &self.vst3_mixer_effect_auxiliary_input_maps,
-                        );
-                    }
-                    let mappings_changed =
-                        remap_midi_vst3_mixer_effect_parameter_targets_after_move(
-                            &mut self.midi_vst3_parameter_mappings,
-                            insert_ordinal,
-                            from_slot,
-                            to_slot,
-                        );
-                    let vst2_cc_mappings_changed =
+                    vst2_cc_mappings_changed |=
                         remap_midi_vst2_mixer_effect_parameter_targets_after_move(
                             &mut self.midi_vst2_mixer_effect_parameter_mappings,
                             insert_ordinal,
@@ -71786,73 +71785,113 @@ impl DawUi {
                             to_slot,
                         );
                     }
-                    let mapping_save_error = mappings_changed
-                        .then(|| {
-                            save_midi_vst3_parameter_mappings(&self.midi_vst3_parameter_mappings)
-                        })
-                        .and_then(Result::err)
-                        .or_else(|| {
-                            vst2_cc_mappings_changed
-                                .then(|| {
-                                    save_midi_vst2_mixer_effect_parameter_mappings(
-                                        &self.midi_vst2_mixer_effect_parameter_mappings,
-                                    )
-                                })
-                                .and_then(Result::err)
-                        })
-                        .or(clap_assignment_save_error)
-                        .or(vst2_auxiliary_map_save_error)
-                        .or(vst3_auxiliary_map_save_error)
-                        .or_else(|| {
-                            pattern_event_links_changed
-                                .then(|| {
-                                    save_pattern_vst2_mixer_effect_parameter_links(
-                                        &self.pattern_vst2_mixer_effect_parameter_links,
-                                    )
-                                })
-                                .and_then(Result::err)
-                        })
-                        .or_else(|| {
-                            playlist_automation_links_changed
-                                .then(|| {
-                                    save_playlist_vst2_mixer_effect_parameter_links(
-                                        &self.playlist_vst2_mixer_effect_parameter_links,
-                                    )
-                                })
-                                .and_then(Result::err)
-                        })
-                        .or_else(|| {
-                            pattern_lfo_links_changed
-                                .then(|| {
-                                    save_pattern_vst2_mixer_effect_lfo_parameter_links(
-                                        &self.pattern_vst2_mixer_effect_lfo_parameter_links,
-                                    )
-                                })
-                                .and_then(Result::err)
-                        })
-                        .or_else(|| {
-                            playlist_lfo_links_changed
-                                .then(|| {
-                                    save_playlist_vst2_mixer_effect_lfo_parameter_links(
-                                        &self.playlist_vst2_mixer_effect_lfo_parameter_links,
-                                    )
-                                })
-                                .and_then(Result::err)
-                        });
-                    self.dirty = true;
-                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
-                    let moved_status = format!(
-                        "Moved Mixer insert {insert_ordinal} effect slot {} to {}",
-                        from_slot + 1,
-                        to_slot + 1,
+                }
+                let clap_assignment_save_error = project_id.as_deref().and_then(|project_id| {
+                    save_clap_project_mixer_effects(project_id, &self.clap_mixer_effect_assignments)
+                        .err()
+                });
+                let vst2_auxiliary_map_save_error = project_id.as_deref().and_then(|project_id| {
+                    let mut mappings = load_vst2_project_mixer_auxiliary_maps(project_id);
+                    for &(insert_ordinal, from_slot, to_slot) in &effect_slot_moves {
+                        remap_vst2_mixer_auxiliary_maps_after_move(
+                            &mut mappings,
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
+                    }
+                    save_vst2_project_mixer_auxiliary_maps(project_id, &mappings).err()
+                });
+                let vst3_auxiliary_map_save_error = project_id.as_deref().and_then(|project_id| {
+                    let mut mappings = load_vst3_project_mixer_auxiliary_maps(project_id);
+                    for &(insert_ordinal, from_slot, to_slot) in &effect_slot_moves {
+                        remap_vst3_mixer_auxiliary_maps_after_move(
+                            &mut mappings,
+                            insert_ordinal,
+                            from_slot,
+                            to_slot,
+                        );
+                    }
+                    save_vst3_project_mixer_auxiliary_maps(project_id, &mappings).err()
+                });
+                let factory = combined_mixer_effect_processor_factory(
+                    self.clap_mixer_effect_assignments.clone(),
+                    self.vst2_mixer_effect_assignments.clone(),
+                    self.vst2_mixer_effect_parameter_sync.clone(),
+                    self.clap_mixer_effect_state_capture_controller.clone(),
+                );
+                if let Some(host) = &mut self.vst3_host {
+                    host.set_mixer_effect_processor_factory(factory);
+                    host.set_mixer_effect_auxiliary_input_source_maps(
+                        &self.vst3_mixer_effect_auxiliary_input_maps,
                     );
-                    self.status = mapping_save_error.map_or(moved_status.clone(), |error| {
-                        format!("{moved_status}; could not save learned MIDI CC links: {error}")
+                }
+                let mapping_save_error = mappings_changed
+                    .then(|| save_midi_vst3_parameter_mappings(&self.midi_vst3_parameter_mappings))
+                    .and_then(Result::err)
+                    .or_else(|| {
+                        vst2_cc_mappings_changed
+                            .then(|| {
+                                save_midi_vst2_mixer_effect_parameter_mappings(
+                                    &self.midi_vst2_mixer_effect_parameter_mappings,
+                                )
+                            })
+                            .and_then(Result::err)
+                    })
+                    .or(clap_assignment_save_error)
+                    .or(vst2_auxiliary_map_save_error)
+                    .or(vst3_auxiliary_map_save_error)
+                    .or_else(|| {
+                        pattern_event_links_changed
+                            .then(|| {
+                                save_pattern_vst2_mixer_effect_parameter_links(
+                                    &self.pattern_vst2_mixer_effect_parameter_links,
+                                )
+                            })
+                            .and_then(Result::err)
+                    })
+                    .or_else(|| {
+                        playlist_automation_links_changed
+                            .then(|| {
+                                save_playlist_vst2_mixer_effect_parameter_links(
+                                    &self.playlist_vst2_mixer_effect_parameter_links,
+                                )
+                            })
+                            .and_then(Result::err)
+                    })
+                    .or_else(|| {
+                        pattern_lfo_links_changed
+                            .then(|| {
+                                save_pattern_vst2_mixer_effect_lfo_parameter_links(
+                                    &self.pattern_vst2_mixer_effect_lfo_parameter_links,
+                                )
+                            })
+                            .and_then(Result::err)
+                    })
+                    .or_else(|| {
+                        playlist_lfo_links_changed
+                            .then(|| {
+                                save_playlist_vst2_mixer_effect_lfo_parameter_links(
+                                    &self.playlist_vst2_mixer_effect_lfo_parameter_links,
+                                )
+                            })
+                            .and_then(Result::err)
                     });
-                }
-                Err(error) => {
-                    self.status = format!("Could not move Mixer effect slot: {error}");
-                }
+                self.dirty = true;
+                self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                let moved_status = if move_count == 1 {
+                    format!(
+                        "Moved Mixer insert {} effect slot {} to {}",
+                        first_move.0,
+                        first_move.1 + 1,
+                        first_move.2 + 1,
+                    )
+                } else {
+                    format!("Moved {move_count} matching selected Mixer effect slots")
+                };
+                self.status = mapping_save_error.map_or(moved_status.clone(), |error| {
+                    format!("{moved_status}; could not save learned MIDI CC links: {error}")
+                });
             }
         }
         if let Some((insert_ordinal, slot_index, instance_id)) = effect_editor_open {
