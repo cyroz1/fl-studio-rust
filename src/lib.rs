@@ -6334,6 +6334,7 @@ impl PlaylistClip {
                 .then_some((start, end))
         } else if self.uses_full_source_window()
             || (self.start_offset == 0.0 && self.end_offset == 0.0)
+            || (self.start_offset == 0.0 && self.end_offset == 1.0)
         {
             (self.length_ticks > 0).then_some((0, self.length_ticks))
         } else {
