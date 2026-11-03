@@ -9689,8 +9689,8 @@ impl FlpDocument {
     }
 
     /// Duplicates a Pattern's note records, raw `0xDF` controller events, recognized time-marker
-    /// events, name, color, and explicit length into a new Pattern. Unknown events and all
-    /// existing Pattern bytes remain untouched.
+    /// events, name, color, and explicit length into a new Pattern immediately after its source.
+    /// Unknown events and all existing Pattern bytes remain untouched.
     pub fn duplicate_pattern(&mut self, pattern_id: u16) -> Result<u16, FlpError> {
         let source_pattern = self
             .patterns()?
@@ -9812,6 +9812,43 @@ impl FlpDocument {
                 .events
                 .splice(insert_index..insert_index, duplicate_auxiliary_events);
         }
+
+        let duplicate_region_end = candidate.events[new_marker_index + 1..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.payload.len() == 2)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(candidate.events.len(), |offset| {
+                new_marker_index + 1 + offset
+            });
+        let duplicate_events = candidate
+            .events
+            .drain(new_marker_index..duplicate_region_end)
+            .collect::<Vec<_>>();
+        let source_marker_index = candidate
+            .events
+            .iter()
+            .position(|event| {
+                event.opcode == 0x41
+                    && event.payload.len() == 2
+                    && event.payload.as_slice() == pattern_id.to_le_bytes()
+            })
+            .ok_or(FlpError::UnsupportedEdit(
+                "the source pattern marker could not be found after duplication",
+            ))?;
+        let source_region_end = candidate.events[source_marker_index + 1..]
+            .iter()
+            .position(|event| {
+                (event.opcode == 0x41 && event.payload.len() == 2)
+                    || matches!(event.opcode, 0x40 | 0x62 | 0x63)
+            })
+            .map_or(candidate.events.len(), |offset| {
+                source_marker_index + 1 + offset
+            });
+        candidate
+            .events
+            .splice(source_region_end..source_region_end, duplicate_events);
         candidate.refresh_event_offsets()?;
         *self = candidate;
         Ok(new_pattern_id)
