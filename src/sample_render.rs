@@ -879,6 +879,8 @@ pub struct PatternInstrumentsPlayback {
     pub extend_preview_tail: bool,
     pub vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     pub vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
+    /// App-local Pattern Event links for loaded VST2 Channel Rack parameters.
+    pub vst2_channel_parameter_automation: BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>,
     /// Live MIDI routed from the selected Pattern channel to loaded VST2 destinations.
     pub vst2_live_input: Option<Vst2LiveInputRouting>,
     pub clap_audio_channel_ids: BTreeSet<u16>,
@@ -1490,6 +1492,8 @@ pub struct PlaylistRenderOptions {
     pub clap_audio_channel_ids: Arc<BTreeSet<u16>>,
     /// Native FLP Automation Clips linked to loaded VST2 instrument parameters.
     pub vst2_channel_automation_clips: Arc<BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>>,
+    /// App-local Pattern Event links expanded for loaded VST2 instrument parameters.
+    pub vst2_channel_pattern_automation: Arc<BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2742,6 +2746,7 @@ impl Default for PlaylistRenderOptions {
             clap_audio_layers: Arc::new(Vec::new()),
             clap_audio_channel_ids: Arc::new(BTreeSet::new()),
             vst2_channel_automation_clips: Arc::new(BTreeMap::new()),
+            vst2_channel_pattern_automation: Arc::new(BTreeMap::new()),
         }
     }
 }
@@ -8947,6 +8952,7 @@ pub fn stream_sampler_pattern_to_device_with_live_controls(
             vst3_processor: None,
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler: false,
             repeat_pattern: false,
             extend_preview_tail: false,
@@ -9007,6 +9013,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device(
             vst3_processor: None,
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler: false,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -9072,6 +9079,7 @@ pub fn stream_sampler_pattern_loop_from_tick_to_device_with_live_controls(
             vst3_processor: None,
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -9108,6 +9116,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device(
             vst3_processor: Some(playback.processor),
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -9145,6 +9154,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_master_contro
             vst3_processor: Some(playback.processor),
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -9181,6 +9191,7 @@ pub fn stream_pattern_loop_with_vst3_from_tick_to_device_with_live_controls(
             vst3_processor: Some(controls.playback.processor),
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler: true,
             repeat_pattern: true,
             extend_preview_tail: false,
@@ -9242,6 +9253,7 @@ pub fn stream_pattern_with_vst3_to_device_with_live_controls(
             vst3_processor: Some(controls.playback.processor),
             vst2_runtime: None,
             vst2_live_input: None,
+            vst2_channel_parameter_automation: BTreeMap::new(),
             allow_empty_sampler: true,
             repeat_pattern: false,
             extend_preview_tail: true,
@@ -9286,6 +9298,7 @@ pub fn stream_pattern_with_loaded_plugins_to_device_with_live_controls(
             vst3_processor: playback.vst3_processor,
             vst2_runtime: playback.vst2_runtime,
             vst2_live_input: playback.vst2_live_input,
+            vst2_channel_parameter_automation: playback.vst2_channel_parameter_automation,
             allow_empty_sampler,
             repeat_pattern: playback.repeat_pattern,
             extend_preview_tail: playback.extend_preview_tail,
@@ -9309,6 +9322,7 @@ struct PatternStreamConfig {
     vst3_processor: Option<Vst3PlaylistStreamProcessor>,
     vst2_runtime: Option<Arc<Mutex<Vst2HostRuntime>>>,
     vst2_live_input: Option<Vst2LiveInputRouting>,
+    vst2_channel_parameter_automation: BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>>,
     allow_empty_sampler: bool,
     repeat_pattern: bool,
     extend_preview_tail: bool,
@@ -10012,6 +10026,15 @@ impl Vst2PatternStreamProcessor {
             while subblock_start < block_end {
                 let mut subblock_frames =
                     (block_end - subblock_start).min(VST2_PATTERN_QUANTUM_FRAMES as u64) as usize;
+                if settings.repeat_pattern {
+                    let frames_until_pattern_boundary =
+                        settings.loop_frames - subblock_start % settings.loop_frames;
+                    subblock_frames = subblock_frames.min(
+                        usize::try_from(frames_until_pattern_boundary)
+                            .unwrap_or(usize::MAX)
+                            .max(1),
+                    );
+                }
                 if let Some(frames_until_cycle_boundary) =
                     settings.frames_until_cycle_boundary(subblock_start)
                 {
@@ -10022,7 +10045,11 @@ impl Vst2PatternStreamProcessor {
                     );
                 }
                 let subblock_end = subblock_start + subblock_frames as u64;
-                let automation_frame = settings.automation_frame_at(subblock_start);
+                let automation_frame = if settings.repeat_pattern {
+                    subblock_start % settings.loop_frames
+                } else {
+                    settings.automation_frame_at(subblock_start)
+                };
                 let mut events = channel.parameter_events(automation_frame, subblock_frames)?;
                 events.extend(channel.take_events(subblock_start, subblock_end)?);
                 events.sort_by_key(|event| event.sample_offset);
@@ -10995,7 +11022,7 @@ fn prepare_vst2_playlist_processor(
     let channel_parameter_automation = expand_playlist_parameter_automation(
         document,
         options.clone(),
-        &BTreeMap::new(),
+        options.vst2_channel_pattern_automation.as_ref(),
         options.vst2_channel_automation_clips.as_ref(),
     )?;
     let mut used_channel_ids = note_plan
@@ -11844,7 +11871,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                 document,
                 pattern_notes: &pattern.notes,
                 channel_infos: &vst2_channel_infos,
-                channel_parameter_automation: BTreeMap::new(),
+                channel_parameter_automation: playback.vst2_channel_parameter_automation.clone(),
                 external_channel_ids: &clap_pattern_channels,
                 volume_expression_channels: &vst3_volume_expression_channels,
                 meters: live_master_meters,
@@ -11855,7 +11882,7 @@ fn stream_pattern_from_tick_with_vst3_to_device(
                     loop_frames,
                     repeat_pattern: playback.repeat_pattern,
                     transport_playing: true,
-                    transport_tempo_map: None,
+                    transport_tempo_map: Some(PlaylistTempoMap::constant(ppq, tempo_bpm)?),
                     transport_cycle_frames: None,
                     pdc_target_frames,
                     master_pitch_cents: document.metadata().master_pitch_cents(),
@@ -28147,6 +28174,7 @@ mod tests {
                     clap_audio_layers: Arc::new(Vec::new()),
                     clap_audio_channel_ids: Arc::new(BTreeSet::new()),
                     vst2_channel_automation_clips: Arc::new(BTreeMap::new()),
+                    vst2_channel_pattern_automation: Arc::new(BTreeMap::new()),
                 },
                 frames: 2,
                 master_output: MixerMasterOutput::default(),

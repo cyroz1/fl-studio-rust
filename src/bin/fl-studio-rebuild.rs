@@ -6127,6 +6127,7 @@ struct DawUi {
     pattern_vst3_parameter_links: Vec<PatternVst3ParameterLink>,
     pattern_vst3_mixer_effect_parameter_links: Vec<PatternVst3MixerEffectParameterLink>,
     pattern_vst2_mixer_effect_parameter_links: Vec<PatternVst2MixerEffectParameterLink>,
+    pattern_vst2_channel_parameter_links: Vec<PatternVst2ChannelParameterLink>,
     pattern_vst2_mixer_effect_lfo_parameter_links: Vec<PatternVst2MixerEffectLfoParameterLink>,
     playlist_vst2_mixer_effect_parameter_links: Vec<PlaylistVst2MixerEffectParameterLink>,
     playlist_vst2_mixer_effect_lfo_parameter_links: Vec<PlaylistVst2MixerEffectLfoParameterLink>,
@@ -7642,6 +7643,15 @@ struct PatternVst2MixerEffectParameterLink {
     fourcc: String,
     parameter_id: u32,
     parameter_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PatternVst2ChannelParameterLink {
+    project_path: String,
+    pattern_id: u16,
+    stream_channel: u8,
+    stream_flags: u8,
+    target: MidiVst2ChannelParameterTarget,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9169,6 +9179,7 @@ impl DawUi {
             load_pattern_vst3_mixer_effect_parameter_links();
         let pattern_vst2_mixer_effect_parameter_links =
             load_pattern_vst2_mixer_effect_parameter_links();
+        let pattern_vst2_channel_parameter_links = load_pattern_vst2_channel_parameter_links();
         let pattern_vst2_mixer_effect_lfo_parameter_links =
             load_pattern_vst2_mixer_effect_lfo_parameter_links();
         let playlist_vst2_mixer_effect_parameter_links =
@@ -9750,6 +9761,7 @@ impl DawUi {
             pattern_vst3_parameter_links,
             pattern_vst3_mixer_effect_parameter_links,
             pattern_vst2_mixer_effect_parameter_links,
+            pattern_vst2_channel_parameter_links,
             pattern_vst2_mixer_effect_lfo_parameter_links,
             playlist_vst2_mixer_effect_parameter_links,
             playlist_vst2_mixer_effect_lfo_parameter_links,
@@ -11550,6 +11562,88 @@ impl DawUi {
             }
         }
         automations
+    }
+
+    fn pattern_vst2_channel_parameter_automations_for_pattern(
+        &self,
+        pattern: &Pattern,
+    ) -> BTreeMap<u16, Vec<Vst3PlaylistParameterAutomation>> {
+        let Some(project_path) = self.current_path.as_deref() else {
+            return BTreeMap::new();
+        };
+        let mut automations = BTreeMap::new();
+        for link in self
+            .pattern_vst2_channel_parameter_links
+            .iter()
+            .filter(|link| {
+                project_paths_equal(Path::new(&link.project_path), project_path)
+                    && link.pattern_id == pattern.id
+                    && valid_pattern_vst2_channel_parameter_link(link)
+            })
+        {
+            let identity_matches = self
+                .vst2_channel_parameter_snapshots
+                .get(&link.target.project_channel_id)
+                .is_some_and(|snapshot| {
+                    snapshot.fourcc == link.target.fourcc
+                        && snapshot.plugin_path.to_string_lossy() == link.target.plugin_path
+                        && snapshot.parameters.iter().any(|parameter| {
+                            parameter.id == link.target.parameter_id
+                                && parameter.automatable
+                                && !parameter.read_only
+                        })
+                });
+            if !identity_matches {
+                continue;
+            }
+            let Some(automation) = pattern_vst2_channel_parameter_automation(link, pattern) else {
+                continue;
+            };
+            automations
+                .entry(link.target.project_channel_id)
+                .or_insert_with(Vec::new)
+                .push(automation);
+        }
+        automations
+    }
+
+    fn pattern_vst2_channel_automation_sources_for_playlist(
+        &self,
+        document: &FlpDocument,
+    ) -> BTreeMap<(u16, u16), Vec<Vst3ParameterAutomation>> {
+        let ppq = document.header().ppq();
+        if ppq == 0 {
+            return BTreeMap::new();
+        }
+        let Ok(patterns) = document.patterns() else {
+            return BTreeMap::new();
+        };
+        let mut sources = BTreeMap::new();
+        for pattern in patterns {
+            for (channel_id, lanes) in
+                self.pattern_vst2_channel_parameter_automations_for_pattern(&pattern)
+            {
+                let converted = lanes
+                    .into_iter()
+                    .map(|lane| Vst3ParameterAutomation {
+                        parameter_id: lane.parameter_id,
+                        points: lane
+                            .points
+                            .into_iter()
+                            .map(|point| Vst3AutomationPoint {
+                                position_beats: point.tick as f64 / f64::from(ppq),
+                                value: point.value,
+                                tension: point.tension,
+                            })
+                            .collect(),
+                    })
+                    .collect::<Vec<_>>();
+                if !converted.is_empty() {
+                    sources.insert((pattern.id, channel_id), converted);
+                }
+            }
+        }
+        sources
     }
 
     fn pattern_vst3_mixer_effect_parameter_automations_for_pattern(
@@ -17541,6 +17635,8 @@ impl DawUi {
                 .vst2_channel_automation_clips
                 .clone(),
         );
+        options.vst2_channel_pattern_automation =
+            Arc::new(self.pattern_vst2_channel_automation_sources_for_playlist(playback_document));
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -18508,6 +18604,8 @@ impl DawUi {
                 .vst2_channel_automation_clips
                 .clone(),
         );
+        options.vst2_channel_pattern_automation =
+            Arc::new(self.pattern_vst2_channel_automation_sources_for_playlist(&static_document));
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -43234,6 +43332,8 @@ impl DawUi {
         let mut midi_vst2_channel_parameter_learn_request = None;
         let mut midi_vst2_channel_parameter_cancel_learning = false;
         let mut midi_vst2_channel_parameter_remove_mapping = None;
+        let mut pattern_vst2_channel_parameter_link_request = None;
+        let mut pattern_vst2_channel_parameter_unlink_request = None;
         let mut open_group_dialog = false;
         let mut open_empty_group_dialog = false;
         let mut rename_group_dialog = None;
@@ -44790,6 +44890,8 @@ impl DawUi {
                                     ui.small("The plug-in reports no writable automatable parameters.");
                                     return;
                                 }
+                                let pattern_event_source =
+                                    self.selected_pattern_vst3_parameter_source();
                                 for parameter in parameters {
                                     let parameter_name = if parameter.name.is_empty() {
                                         format!("Parameter {}", parameter.id)
@@ -44806,6 +44908,38 @@ impl DawUi {
                                     let mapping = midi_vst2_channel_parameter_mapping_for_target(
                                         &self.midi_vst2_channel_parameter_mappings,
                                         &target,
+                                    );
+                                    let existing_event_link_target = self
+                                        .current_path
+                                        .as_ref()
+                                        .zip(self.selected_pattern)
+                                        .map(|(project_path, pattern_id)| {
+                                            PatternVst2ChannelParameterLink {
+                                                project_path: project_path.to_string_lossy().into_owned(),
+                                                pattern_id,
+                                                stream_channel: 0,
+                                                stream_flags: 0,
+                                                target: target.clone(),
+                                            }
+                                        });
+                                    let existing_event_link = existing_event_link_target
+                                        .as_ref()
+                                        .and_then(|target| {
+                                            pattern_vst2_channel_parameter_link_for_target(
+                                                &self.pattern_vst2_channel_parameter_links,
+                                                target,
+                                            )
+                                        });
+                                    let selected_event_link_target = pattern_event_source.as_ref().map(
+                                        |(project_path, pattern_id, stream_channel, stream_flags)| {
+                                            PatternVst2ChannelParameterLink {
+                                                project_path: project_path.clone(),
+                                                pattern_id: *pattern_id,
+                                                stream_channel: *stream_channel,
+                                                stream_flags: *stream_flags,
+                                                target: target.clone(),
+                                            }
+                                        },
                                     );
                                     let learning = self
                                         .midi_vst2_channel_parameter_learning
@@ -44842,6 +44976,51 @@ impl DawUi {
                                                 midi_vst2_channel_parameter_remove_mapping =
                                                     Some(target.clone());
                                             }
+                                        }
+                                        if let Some(event_link) = existing_event_link {
+                                            ui.small(format!(
+                                                "Pattern Event · stream {} / 0x{:02X}",
+                                                event_link.stream_channel, event_link.stream_flags
+                                            ));
+                                            if let Some(event_target) =
+                                                selected_event_link_target.as_ref()
+                                                && (event_target.stream_channel
+                                                    != event_link.stream_channel
+                                                    || event_target.stream_flags
+                                                        != event_link.stream_flags)
+                                                && ui.small_button("Relink Event").clicked()
+                                            {
+                                                pattern_vst2_channel_parameter_link_request =
+                                                    Some(event_target.clone());
+                                            }
+                                            if ui.small_button("Clear Event").clicked()
+                                                && let Some(target) =
+                                                    existing_event_link_target.as_ref()
+                                            {
+                                                pattern_vst2_channel_parameter_unlink_request =
+                                                    Some(target.clone());
+                                            }
+                                        } else if let Some(event_target) =
+                                            selected_event_link_target.as_ref()
+                                        {
+                                            if ui
+                                                .small_button("Link Event")
+                                                .on_hover_text(
+                                                    "Link the selected Pattern Event stream to this VST2 parameter.",
+                                                )
+                                                .clicked()
+                                            {
+                                                pattern_vst2_channel_parameter_link_request =
+                                                    Some(event_target.clone());
+                                            }
+                                        } else {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new("Link Event"),
+                                            )
+                                            .on_hover_text(
+                                                "Select a Pattern Event stream in the Piano roll first.",
+                                            );
                                         }
                                     });
                                 }
@@ -46433,6 +46612,47 @@ impl DawUi {
                 |error| {
                     format!(
                         "Cleared VST2 MIDI CC link for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        if let Some(link) = pattern_vst2_channel_parameter_unlink_request {
+            remove_pattern_vst2_channel_parameter_link(
+                &mut self.pattern_vst2_channel_parameter_links,
+                &link,
+            );
+            self.status = save_pattern_vst2_channel_parameter_links(
+                &self.pattern_vst2_channel_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || format!("Cleared Pattern Event link for VST2 {}", link.target.parameter_name),
+                |error| {
+                    format!(
+                        "Cleared VST2 Pattern Event link for this session; could not save it: {error}"
+                    )
+                },
+            );
+        }
+        if let Some(link) = pattern_vst2_channel_parameter_link_request {
+            upsert_pattern_vst2_channel_parameter_link(
+                &mut self.pattern_vst2_channel_parameter_links,
+                link.clone(),
+            );
+            self.status = save_pattern_vst2_channel_parameter_links(
+                &self.pattern_vst2_channel_parameter_links,
+            )
+            .err()
+            .map_or_else(
+                || {
+                    format!(
+                        "Linked Pattern {} event stream to VST2 {} on this machine",
+                        link.pattern_id, link.target.parameter_name
+                    )
+                },
+                |error| {
+                    format!(
+                        "Linked VST2 Pattern Event stream for this session; could not save it: {error}"
                     )
                 },
             );
@@ -57468,6 +57688,11 @@ impl DawUi {
         } else {
             BTreeMap::new()
         };
+        let vst2_channel_parameter_automation = pattern_for_vst3
+            .as_ref()
+            .map_or_else(BTreeMap::new, |pattern| {
+                self.pattern_vst2_channel_parameter_automations_for_pattern(pattern)
+            });
         let pattern_mixer_effect_automations =
             pattern_for_vst3
                 .as_ref()
@@ -57691,6 +57916,7 @@ impl DawUi {
                                     extend_preview_tail,
                                     vst3_processor,
                                     vst2_runtime,
+                                    vst2_channel_parameter_automation,
                                     vst2_live_input: live_vst2_input_routing
                                         .zip(live_vst2_receiver)
                                         .map(
@@ -58981,6 +59207,8 @@ impl DawUi {
                 .vst2_channel_automation_clips
                 .clone(),
         );
+        options.vst2_channel_pattern_automation =
+            Arc::new(self.pattern_vst2_channel_automation_sources_for_playlist(&render_document));
         let playlist_parameter_automation = Vst3PlaylistAutomationSources {
             pattern_clips: linked_automation_sources.pattern_clips,
             mixer_effect_pattern_clips: linked_automation_sources.mixer_effect_pattern_clips,
@@ -59775,6 +60003,8 @@ impl DawUi {
                 .vst2_channel_automation_clips
                 .clone(),
         );
+        options.vst2_channel_pattern_automation =
+            Arc::new(self.pattern_vst2_channel_automation_sources_for_playlist(document));
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -59957,6 +60187,8 @@ impl DawUi {
                 .vst2_channel_automation_clips
                 .clone(),
         );
+        options.vst2_channel_pattern_automation =
+            Arc::new(self.pattern_vst2_channel_automation_sources_for_playlist(document));
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -60061,6 +60293,8 @@ impl DawUi {
                 .vst2_channel_automation_clips
                 .clone(),
         );
+        options.vst2_channel_pattern_automation =
+            Arc::new(self.pattern_vst2_channel_automation_sources_for_playlist(document));
         let vst3_processor = self
             .vst3_host
             .as_ref()
@@ -86730,6 +86964,10 @@ fn pattern_vst2_mixer_effect_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst2-mixer-effect-parameter-links.txt")
 }
 
+fn pattern_vst2_channel_parameter_links_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("pattern-vst2-channel-parameter-links.txt")
+}
+
 fn pattern_vst2_mixer_effect_lfo_parameter_links_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("pattern-vst2-mixer-effect-lfo-parameter-links.txt")
 }
@@ -86875,6 +87113,13 @@ fn load_pattern_vst2_mixer_effect_parameter_links() -> Vec<PatternVst2MixerEffec
     pattern_vst2_mixer_effect_parameter_links_file()
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|contents| parse_pattern_vst2_mixer_effect_parameter_links(&contents))
+        .unwrap_or_default()
+}
+
+fn load_pattern_vst2_channel_parameter_links() -> Vec<PatternVst2ChannelParameterLink> {
+    pattern_vst2_channel_parameter_links_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| parse_pattern_vst2_channel_parameter_links(&contents))
         .unwrap_or_default()
 }
 
@@ -87309,6 +87554,20 @@ fn save_pattern_vst2_mixer_effect_parameter_links(
         serialize_pattern_vst2_mixer_effect_parameter_links(links),
     )
     .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
+fn save_pattern_vst2_channel_parameter_links(
+    links: &[PatternVst2ChannelParameterLink],
+) -> Result<(), String> {
+    let path = pattern_vst2_channel_parameter_links_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the Pattern VST2 Channel Rack link path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, serialize_pattern_vst2_channel_parameter_links(links))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
 }
 
 fn save_pattern_vst2_mixer_effect_lfo_parameter_links(
@@ -89599,6 +89858,81 @@ fn pattern_vst2_mixer_effect_parameter_automation(
     })
 }
 
+fn valid_pattern_vst2_channel_parameter_link(link: &PatternVst2ChannelParameterLink) -> bool {
+    !link.project_path.is_empty()
+        && !link.target.plugin_path.is_empty()
+        && !link.target.fourcc.is_empty()
+}
+
+fn same_pattern_vst2_channel_parameter_link_target(
+    link: &PatternVst2ChannelParameterLink,
+    target: &PatternVst2ChannelParameterLink,
+) -> bool {
+    project_paths_equal(
+        Path::new(&link.project_path),
+        Path::new(&target.project_path),
+    ) && link.pattern_id == target.pattern_id
+        && link.target.project_channel_id == target.target.project_channel_id
+        && Path::new(&link.target.plugin_path) == Path::new(&target.target.plugin_path)
+        && link.target.fourcc == target.target.fourcc
+        && link.target.parameter_id == target.target.parameter_id
+}
+
+fn upsert_pattern_vst2_channel_parameter_link(
+    links: &mut Vec<PatternVst2ChannelParameterLink>,
+    link: PatternVst2ChannelParameterLink,
+) {
+    if !valid_pattern_vst2_channel_parameter_link(&link) {
+        return;
+    }
+    links.retain(|existing| !same_pattern_vst2_channel_parameter_link_target(existing, &link));
+    links.push(link);
+}
+
+fn remove_pattern_vst2_channel_parameter_link(
+    links: &mut Vec<PatternVst2ChannelParameterLink>,
+    target: &PatternVst2ChannelParameterLink,
+) {
+    links.retain(|link| !same_pattern_vst2_channel_parameter_link_target(link, target));
+}
+
+fn pattern_vst2_channel_parameter_link_for_target<'a>(
+    links: &'a [PatternVst2ChannelParameterLink],
+    target: &PatternVst2ChannelParameterLink,
+) -> Option<&'a PatternVst2ChannelParameterLink> {
+    links
+        .iter()
+        .find(|link| same_pattern_vst2_channel_parameter_link_target(link, target))
+}
+
+fn pattern_vst2_channel_parameter_automation(
+    link: &PatternVst2ChannelParameterLink,
+    pattern: &Pattern,
+) -> Option<Vst3PlaylistParameterAutomation> {
+    if !valid_pattern_vst2_channel_parameter_link(link) {
+        return None;
+    }
+    let points = pattern
+        .controllers
+        .iter()
+        .filter(|point| point.channel == link.stream_channel && point.flags == link.stream_flags)
+        .filter_map(|point| {
+            let value = point.value();
+            (value.is_finite() && (0.0..=1.0).contains(&value)).then_some(
+                Vst3PlaylistAutomationPoint {
+                    tick: u64::from(point.position),
+                    value: f64::from(value),
+                    tension: 0.0,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    (!points.is_empty()).then_some(Vst3PlaylistParameterAutomation {
+        parameter_id: link.target.parameter_id,
+        points,
+    })
+}
+
 fn pattern_vst2_mixer_effect_lfo_parameter_automation(
     link: &PatternVst2MixerEffectLfoParameterLink,
     ppq: u16,
@@ -90982,6 +91316,98 @@ fn serialize_pattern_vst3_mixer_effect_parameter_links(
         contents.push_str(&link.target.slot_index.to_string());
         contents.push('\t');
         contents.push_str(&encode_midi_device_id(&link.target.plugin_uid));
+        contents.push('\t');
+        contents.push_str(&link.target.parameter_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.parameter_name));
+        contents.push('\n');
+    }
+    contents
+}
+
+fn parse_pattern_vst2_channel_parameter_links(
+    contents: &str,
+) -> Vec<PatternVst2ChannelParameterLink> {
+    let mut links = Vec::new();
+    for line in contents.lines() {
+        let Some(encoded) = line.strip_prefix("link=") else {
+            continue;
+        };
+        let mut fields = encoded.split('\t');
+        let Some(project_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(pattern_id) = fields.next().and_then(|field| field.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Some(stream_channel) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(stream_flags) = fields.next().and_then(|field| field.parse::<u8>().ok()) else {
+            continue;
+        };
+        let Some(project_channel_id) = fields.next().and_then(|field| field.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(plugin_path) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(fourcc) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        let Some(parameter_id) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(parameter_name) = fields.next().and_then(decode_midi_device_id) else {
+            continue;
+        };
+        if fields.next().is_some() {
+            continue;
+        }
+        upsert_pattern_vst2_channel_parameter_link(
+            &mut links,
+            PatternVst2ChannelParameterLink {
+                project_path,
+                pattern_id,
+                stream_channel,
+                stream_flags,
+                target: MidiVst2ChannelParameterTarget {
+                    project_channel_id,
+                    plugin_path,
+                    fourcc,
+                    parameter_id,
+                    parameter_name,
+                },
+            },
+        );
+    }
+    links
+}
+
+fn serialize_pattern_vst2_channel_parameter_links(
+    links: &[PatternVst2ChannelParameterLink],
+) -> String {
+    let mut contents = String::from("version=1\n");
+    let mut normalized = Vec::new();
+    for link in links {
+        upsert_pattern_vst2_channel_parameter_link(&mut normalized, link.clone());
+    }
+    for link in normalized {
+        contents.push_str("link=");
+        contents.push_str(&encode_midi_device_id(&link.project_path));
+        contents.push('\t');
+        contents.push_str(&link.pattern_id.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_channel.to_string());
+        contents.push('\t');
+        contents.push_str(&link.stream_flags.to_string());
+        contents.push('\t');
+        contents.push_str(&link.target.project_channel_id.to_string());
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.plugin_path));
+        contents.push('\t');
+        contents.push_str(&encode_midi_device_id(&link.target.fourcc));
         contents.push('\t');
         contents.push_str(&link.target.parameter_id.to_string());
         contents.push('\t');
