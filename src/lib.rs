@@ -6447,7 +6447,7 @@ pub struct PlaylistClipEdit {
     pub muted: Option<bool>,
     pub start_offset: Option<f32>,
     pub end_offset: Option<f32>,
-    /// Candidate source-window tick bounds for one 88-byte Audio Clip record.
+    /// Source-window tick bounds for an 88-byte Audio Clip or Pattern Clip record.
     pub source_window_ticks: Option<(u32, u32)>,
     pub scale: Option<f64>,
 }
@@ -12262,7 +12262,7 @@ impl FlpDocument {
 
     /// Edits fields with established playlist record offsets while preserving every other byte.
     /// `clip_index` is zero-based in the selected arrangement's stored clip order. Candidate
-    /// source-window ticks can be edited for 88-byte Audio Clips.
+    /// source-window ticks can be edited for 88-byte Audio Clips and Pattern Clips.
     pub fn edit_playlist_clip(
         &mut self,
         arrangement_id: u16,
@@ -12315,7 +12315,7 @@ impl FlpDocument {
             .is_some_and(|(start, end)| start >= end)
         {
             return Err(FlpError::UnsupportedEdit(
-                "Audio Clip source end tick must be after its start tick",
+                "clip source end tick must be after its start tick",
             ));
         }
         let record_start = clip
@@ -12342,11 +12342,7 @@ impl FlpDocument {
                     "source-window tick editing is only available for 88-byte Playlist records",
                 ));
             }
-            if edit.item_index.is_some() {
-                return Err(FlpError::UnsupportedEdit(
-                    "edit the Audio Clip source window separately from its target",
-                ));
-            }
+            let is_pattern_clip = matches!(clip.target(), PlaylistClipTarget::Pattern { .. });
             let is_audio_clip = match clip.target() {
                 PlaylistClipTarget::Channel { id } => {
                     let channels = self.channels();
@@ -12358,20 +12354,25 @@ impl FlpDocument {
                 }
                 PlaylistClipTarget::Pattern { .. } => false,
             };
-            if !is_audio_clip {
+            if !is_audio_clip && !is_pattern_clip {
                 return Err(FlpError::UnsupportedEdit(
-                    "source-window tick editing applies to 88-byte Audio Clips",
+                    "source-window tick editing applies to 88-byte Audio Clips and Pattern Clips",
                 ));
             }
-            if edit
-                .length_ticks
-                .is_some_and(|length| end_tick.checked_sub(start_tick) != Some(length))
+            if edit.item_index.is_some() && !is_pattern_clip {
+                return Err(FlpError::UnsupportedEdit(
+                    "Audio Clip source-window edits cannot also change the target",
+                ));
+            }
+            let expected_span = edit.length_ticks.unwrap_or(clip.length_ticks);
+            if (is_pattern_clip || edit.length_ticks.is_some())
+                && end_tick.checked_sub(start_tick) != Some(expected_span)
             {
                 return Err(FlpError::UnsupportedEdit(
-                    "an Audio Clip's source tick span must match its edited timeline length",
+                    "the source tick span must match the clip timeline length",
                 ));
             }
-            edits_audio_clip_window = true;
+            edits_audio_clip_window = is_audio_clip;
             debug_assert!(start_tick < end_tick);
         }
         if edit.scale.is_some() && !matches!(record_size, 60 | 80) {
@@ -15968,6 +15969,8 @@ impl FlpDocument {
                 ),
                 item_index: Some(merged_item_index),
                 length_ticks: Some(merged_length_ticks),
+                source_window_ticks: (receiver_clip.record_size == 88)
+                    .then_some((0, merged_length_ticks)),
                 ..PlaylistClipEdit::default()
             },
         )?;
