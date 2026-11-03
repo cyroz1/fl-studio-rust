@@ -4478,6 +4478,10 @@ enum PlaylistClipDragKind {
         source_end_tick: u32,
         sample_length_ticks: u32,
     },
+    ResizePatternTicks {
+        source_start_tick: u32,
+        source_end_tick: u32,
+    },
     ResizeAudioMilliseconds {
         edge: PlaylistClipResizeEdge,
         source_start_ms: f32,
@@ -4531,6 +4535,7 @@ struct PlaylistClipDragTarget {
     start_track_index: u16,
     audio_resize_ticks: Option<(u32, u32, u32)>,
     audio_resize_milliseconds: Option<(f32, f32, f32, f32, f32)>,
+    pattern_resize_ticks: Option<(u32, u32)>,
     audio_slip_window: Option<PlaylistClipSlipWindow>,
 }
 
@@ -36068,6 +36073,8 @@ impl DawUi {
                             );
                             let can_resize_audio_ticks =
                                 is_audio_clip && audio_resize_ticks.is_some();
+                            let pattern_resize_ticks =
+                                playlist_pattern_clip_resize_ticks(clip);
                             let can_resize_clip =
                                 clip.can_resize_timeline_length() || can_resize_audio_ticks;
                             let can_split_pattern_clip = context_split_position.is_some_and(
@@ -36105,6 +36112,8 @@ impl DawUi {
                                 }
                             } else if clip.has_opaque_record_tail() && is_audio_clip {
                                 "Drag to move. Shift-drag either edge to trim or extend this Audio Clip's explicit source tick window. Eligible selected Audio Clips can trim or extend together from either edge."
+                            } else if pattern_resize_ticks.is_some() {
+                                "Drag to move. Shift-drag the right edge to resize; Shift-drag the left edge to trim or extend the recognized Pattern source window. Eligible selected Pattern Clips can trim or extend together from the left edge."
                             } else if is_audio_clip {
                                 "Drag to move. Shift-drag either edge to trim or extend eligible legacy Audio Clips when the sample is loaded, the source window matches the timeline at base tempo, scale is default, and no Playlist tempo automation overlaps; selected eligible clips share the same trim change."
                             } else if clip.has_opaque_record_tail() {
@@ -37465,6 +37474,7 @@ impl DawUi {
                                     Some(PlaylistClipResizeEdge::Left) => {
                                         can_resize_audio_ticks
                                             || audio_resize_milliseconds.is_some()
+                                            || pattern_resize_ticks.is_some()
                                     }
                                     Some(PlaylistClipResizeEdge::Right) => can_resize_clip,
                                     None => false,
@@ -37494,6 +37504,8 @@ impl DawUi {
                                                         })
                                                 }),
                                             Some(PlaylistClipResizeEdge::Left) => {
+                                                let group_uses_pattern_ticks =
+                                                    pattern_resize_ticks.is_some();
                                                 let group_uses_ticks =
                                                     clip.has_opaque_record_tail();
                                                 self.selected_playlist_clips.iter().all(
@@ -37502,7 +37514,12 @@ impl DawUi {
                                                             .clips
                                                             .get(*selected_index)
                                                             .is_some_and(|selected_clip| {
-                                                                if group_uses_ticks {
+                                                                if group_uses_pattern_ticks {
+                                                                    playlist_pattern_clip_resize_ticks(
+                                                                        selected_clip,
+                                                                    )
+                                                                    .is_some()
+                                                                } else if group_uses_ticks {
                                                                     playlist_audio_clip_resize_ticks_from_project(
                                                                         selected_clip,
                                                                         audio_resize_context,
@@ -37585,6 +37602,8 @@ impl DawUi {
                                                         target_clip,
                                                         audio_resize_context,
                                                     ),
+                                                pattern_resize_ticks:
+                                                    playlist_pattern_clip_resize_ticks(target_clip),
                                                 audio_slip_window:
                                                     playlist_audio_clip_slip_window_from_project(
                                                         target_clip,
@@ -37601,6 +37620,7 @@ impl DawUi {
                                         start_track_index: clip.track_index.unwrap_or(row),
                                         audio_resize_ticks,
                                         audio_resize_milliseconds,
+                                        pattern_resize_ticks,
                                         audio_slip_window:
                                             playlist_audio_clip_slip_window_from_project(
                                                 clip,
@@ -37673,6 +37693,15 @@ impl DawUi {
                                                         sample_length_ms,
                                                         stored_start_offset,
                                                         stored_end_offset,
+                                                    }
+                                                } else if let (
+                                                    Some(PlaylistClipResizeEdge::Left),
+                                                    Some((source_start_tick, source_end_tick)),
+                                                ) = (resize_edge_requested, pattern_resize_ticks)
+                                                {
+                                                    PlaylistClipDragKind::ResizePatternTicks {
+                                                        source_start_tick,
+                                                        source_end_tick,
                                                     }
                                                 } else {
                                                     PlaylistClipDragKind::Resize
@@ -37763,7 +37792,7 @@ impl DawUi {
                                     } | PlaylistClipDragKind::ResizeAudioMilliseconds {
                                         edge: PlaylistClipResizeEdge::Left,
                                         ..
-                                    }
+                                    } | PlaylistClipDragKind::ResizePatternTicks { .. }
                                 ) && group_targets.len() > 1
                                 {
                                     playlist_clip_group_left_resize_edits(
@@ -37967,7 +37996,8 @@ impl DawUi {
                                         }
                                         PlaylistClipDragKind::Resize
                                         | PlaylistClipDragKind::ResizeAudioTicks { .. }
-                                        | PlaylistClipDragKind::ResizeAudioMilliseconds { .. } => {
+                                        | PlaylistClipDragKind::ResizeAudioMilliseconds { .. }
+                                        | PlaylistClipDragKind::ResizePatternTicks { .. } => {
                                             for (edited_index, edit) in &edits {
                                                 document.edit_playlist_clip(
                                                     arrangement.id,
@@ -37997,7 +38027,8 @@ impl DawUi {
                                                 }
                                                 PlaylistClipDragKind::Resize
                                                 | PlaylistClipDragKind::ResizeAudioTicks { .. }
-                                                | PlaylistClipDragKind::ResizeAudioMilliseconds { .. } => {
+                                                | PlaylistClipDragKind::ResizeAudioMilliseconds { .. }
+                                                | PlaylistClipDragKind::ResizePatternTicks { .. } => {
                                                     if edits.len() > 1 {
                                                         format!(
                                                             "Resized {} Playlist clips",
@@ -41105,6 +41136,7 @@ impl DawUi {
                 start_track_index: drag.start_track_index,
                 audio_resize_ticks: Some((source_start_tick, source_end_tick, sample_length_ticks)),
                 audio_resize_milliseconds: None,
+                pattern_resize_ticks: None,
                 audio_slip_window: None,
             }),
             PlaylistClipDragKind::ResizeAudioMilliseconds {
@@ -41127,6 +41159,7 @@ impl DawUi {
                     stored_start_offset,
                     stored_end_offset,
                 )),
+                pattern_resize_ticks: None,
                 audio_slip_window: None,
             }),
             _ => None,
@@ -96139,6 +96172,19 @@ fn playlist_audio_clip_split_supported(
         && split_source_ms < source_end_ms as f32
 }
 
+fn playlist_pattern_clip_resize_ticks(clip: &PlaylistClip) -> Option<(u32, u32)> {
+    if clip.record_size != 88
+        || !matches!(
+            clip.target(),
+            flp_rebuild::PlaylistClipTarget::Pattern { .. }
+        )
+        || !clip.has_default_scale()
+    {
+        return None;
+    }
+    clip.recognized_pattern_source_window_ticks()
+}
+
 fn playlist_pattern_clip_split_supported(
     clip: &PlaylistClip,
     split_position_ticks: u32,
@@ -98830,6 +98876,35 @@ fn playlist_clip_drag_edit_with_snap(
                 }
             }
         },
+        PlaylistClipDragKind::ResizePatternTicks {
+            source_start_tick,
+            source_end_tick,
+        } => {
+            let start_position = i64::from(drag.start_position_ticks);
+            let end_position = start_position + i64::from(drag.start_length_ticks);
+            let source_span = i64::from(source_end_tick) - i64::from(source_start_tick);
+            let minimum_position = 0_i64
+                .max(start_position - i64::from(source_start_tick))
+                .max(end_position - i64::from(u32::MAX));
+            let maximum_position = (end_position - 1)
+                .min(i64::from(u32::MAX))
+                .min(start_position + source_span - 1);
+            let position_ticks = i64::from(snap_note_tick(
+                start_position.saturating_add(tick_delta),
+                snap_ticks,
+                0,
+            ))
+            .clamp(minimum_position, maximum_position);
+            let source_start_tick =
+                (i64::from(source_start_tick) + position_ticks - start_position) as u32;
+            let length_ticks = (end_position - position_ticks) as u32;
+            PlaylistClipEdit {
+                position_ticks: Some(position_ticks as u32),
+                length_ticks: Some(length_ticks),
+                source_window_ticks: Some((source_start_tick, source_end_tick)),
+                ..PlaylistClipEdit::default()
+            }
+        }
         PlaylistClipDragKind::ResizeAudioMilliseconds {
             edge,
             source_start_ms,
@@ -99136,6 +99211,53 @@ fn playlist_clip_group_left_resize_edits(
         .position_ticks
         .unwrap_or(drag.start_position_ticks);
     let requested_delta = i64::from(anchor_position) - i64::from(drag.start_position_ticks);
+    if targets
+        .iter()
+        .all(|target| target.pattern_resize_ticks.is_some())
+    {
+        let minimum_delta = targets
+            .iter()
+            .map(|target| {
+                let (source_start_tick, _) = target.pattern_resize_ticks.unwrap_or_default();
+                (-i64::from(target.start_position_ticks))
+                    .max(-i64::from(source_start_tick))
+                    .max(i64::from(target.start_length_ticks) - i64::from(u32::MAX))
+            })
+            .max()
+            .unwrap_or_default();
+        let maximum_delta = targets
+            .iter()
+            .map(|target| {
+                let (source_start_tick, source_end_tick) =
+                    target.pattern_resize_ticks.unwrap_or_default();
+                (i64::from(target.start_length_ticks) - 1)
+                    .min(i64::from(u32::MAX) - i64::from(target.start_position_ticks))
+                    .min(i64::from(source_end_tick) - i64::from(source_start_tick) - 1)
+            })
+            .min()
+            .unwrap_or_default();
+        let delta = requested_delta.clamp(minimum_delta, maximum_delta);
+
+        return targets
+            .iter()
+            .map(|target| {
+                let (source_start_tick, source_end_tick) =
+                    target.pattern_resize_ticks.unwrap_or_default();
+                let position_ticks = (i64::from(target.start_position_ticks) + delta) as u32;
+                let length_ticks = (i64::from(target.start_length_ticks) - delta) as u32;
+                let source_start_tick = (i64::from(source_start_tick) + delta) as u32;
+                (
+                    target.clip_index,
+                    PlaylistClipEdit {
+                        position_ticks: Some(position_ticks),
+                        length_ticks: Some(length_ticks),
+                        source_window_ticks: Some((source_start_tick, source_end_tick)),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+            })
+            .collect();
+    }
     if targets
         .iter()
         .all(|target| target.audio_resize_ticks.is_some())
