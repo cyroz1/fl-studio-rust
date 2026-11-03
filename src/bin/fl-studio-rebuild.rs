@@ -5999,6 +5999,8 @@ struct DawUi {
     pattern_time_signature_dialog_open: bool,
     selected_mixer_insert: Option<usize>,
     selected_mixer_inserts: BTreeSet<usize>,
+    mixer_drag_select_anchor: Option<usize>,
+    mixer_drag_select_moved: bool,
     mixer_scroll_to_track: Option<usize>,
     mixer_track_name_editor_requested: bool,
     open_help_manual_requested: bool,
@@ -9634,6 +9636,8 @@ impl DawUi {
             pattern_time_signature_dialog_open: false,
             selected_mixer_insert: None,
             selected_mixer_inserts: BTreeSet::new(),
+            mixer_drag_select_anchor: None,
+            mixer_drag_select_moved: false,
             mixer_scroll_to_track: None,
             mixer_track_name_editor_requested: false,
             open_help_manual_requested: false,
@@ -67193,7 +67197,7 @@ impl DawUi {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.horizontal_top(|ui| {
-                                for insert in &inserts {
+                                for (insert_position, insert) in inserts.iter().enumerate() {
                                     let selected =
                                         self.selected_mixer_inserts.contains(&insert.ordinal());
                                     let fill = if selected { PANEL_LIGHT } else { PANEL_DARK };
@@ -67233,13 +67237,43 @@ impl DawUi {
                                                 let track_button = ui.add_sized(
                                                     [104.0, 26.0],
                                                     egui::Button::selectable(selected, display_name),
+                                                )
+                                                .on_hover_text(
+                                                    "Click to inspect. Ctrl/Cmd+Shift-click toggles selection; drag across strip headers to select a contiguous range.",
                                                 );
                                                 let multi_select_modifier = ui.input(|input| {
                                                     input.modifiers.shift
                                                         && (input.modifiers.command
                                                             || input.modifiers.ctrl)
                                                 });
-                                                if track_button.clicked() {
+                                                if self.mixer_drag_select_anchor.is_none()
+                                                    && track_button.is_pointer_button_down_on()
+                                                {
+                                                    self.mixer_drag_select_anchor =
+                                                        Some(insert_position);
+                                                    self.mixer_drag_select_moved = false;
+                                                }
+                                                if ui.input(|input| input.pointer.primary_down())
+                                                    && track_button.hovered()
+                                                    && let Some(anchor) =
+                                                        self.mixer_drag_select_anchor
+                                                    && insert_position != anchor
+                                                {
+                                                    self.mixer_drag_select_moved = true;
+                                                    let range_start = anchor.min(insert_position);
+                                                    let range_end = anchor.max(insert_position);
+                                                    self.selected_mixer_inserts = inserts
+                                                        .iter()
+                                                        .skip(range_start)
+                                                        .take(range_end - range_start + 1)
+                                                        .map(MixerInsertSummary::ordinal)
+                                                        .collect();
+                                                    self.selected_mixer_insert =
+                                                        Some(insert.ordinal());
+                                                }
+                                                if track_button.clicked()
+                                                    && !self.mixer_drag_select_moved
+                                                {
                                                     let track_ordinal = insert.ordinal();
                                                     if multi_select_modifier {
                                                         if !self
@@ -71932,6 +71966,10 @@ impl DawUi {
             || selected_inserts_before_ui != self.selected_mixer_inserts
         {
             mixer_refresh_flags |= SCRIPT_HW_DIRTY_MIXER_SEL;
+        }
+        if !ui.input(|input| input.pointer.primary_down()) {
+            self.mixer_drag_select_anchor = None;
+            self.mixer_drag_select_moved = false;
         }
         if !dirty_mixer_tracks.is_empty() || mixer_refresh_flags != 0 {
             let dirty_mixer_tracks = dirty_mixer_tracks.into_iter().collect::<Vec<_>>();
