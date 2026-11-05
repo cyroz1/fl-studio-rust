@@ -3219,6 +3219,113 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    fn aiff16_fixture() -> Vec<u8> {
+        // Minimal AIFF: mono, 2 frames, 44,100 Hz, 16-bit samples.
+        let mut comm = Vec::new();
+        comm.extend_from_slice(&1u16.to_be_bytes());
+        comm.extend_from_slice(&2u32.to_be_bytes());
+        comm.extend_from_slice(&16u16.to_be_bytes());
+        // 80-bit extended float for 44,100: exponent 0x400E, mantissa 0xAC44...
+        comm.extend_from_slice(&0x400Eu16.to_be_bytes());
+        comm.extend_from_slice(&0xAC44_0000_0000_0000u64.to_be_bytes());
+        let mut ssnd = Vec::new();
+        ssnd.extend_from_slice(&0u32.to_be_bytes());
+        ssnd.extend_from_slice(&0u32.to_be_bytes());
+        ssnd.extend_from_slice(&[0x80, 0x00, 0x7F, 0xFF]);
+        let mut body = Vec::new();
+        body.extend_from_slice(b"AIFF");
+        body.extend_from_slice(b"COMM");
+        body.extend_from_slice(&(comm.len() as u32).to_be_bytes());
+        body.extend_from_slice(&comm);
+        body.extend_from_slice(b"SSND");
+        body.extend_from_slice(&(ssnd.len() as u32).to_be_bytes());
+        body.extend_from_slice(&ssnd);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FORM");
+        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    #[test]
+    fn decodes_audio_by_content_when_the_extension_lies() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let wav = pcm16_wav_fixture();
+        for name in ["voice.mp3", "voice.flac", "voice.txt", "voice"] {
+            let path = root.join(name);
+            std::fs::write(&path, &wav).unwrap();
+            let decoded = decode_audio_file(&path).unwrap();
+            assert_eq!(decoded.sample_rate, 44_100, "{name}");
+            assert_eq!(decoded.frame_count(), 2, "{name}");
+            assert_eq!(decoded.channels[0][0], -1.0, "{name}");
+        }
+        // AIFF content also decodes by content, even under a WAV name.
+        let path = root.join("voice.wav");
+        std::fs::write(&path, aiff16_fixture()).unwrap();
+        let decoded = decode_audio_file(&path).unwrap();
+        assert_eq!(decoded.sample_rate, 44_100);
+        assert_eq!(decoded.frame_count(), 2);
+        assert_eq!(decoded.channels[0][0], -1.0);
+        assert!((decoded.channels[0][1] - 0.999_969_5).abs() < 1e-6);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decode_rejects_empty_tiny_and_garbage_files_without_panicking() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let garbage: Vec<u8> = (0..4096_u32)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        for (name, bytes) in [
+            ("empty.wav", Vec::new()),
+            ("tiny.wav", vec![0x52, 0x49, 0x46]),
+            ("garbage.wav", garbage),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(decode_audio_file(&path).is_err(), "{name}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decode_rejects_truncated_wavpack_and_empty_wave_data() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let mut padded_wavpack = b"wvpk".to_vec();
+        padded_wavpack.resize(64, 0);
+        for (name, bytes) in [("bare.wv", b"wvpk".to_vec()), ("padded.wv", padded_wavpack)] {
+            let path = root.join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(decode_audio_file(&path).is_err(), "{name}");
+        }
+        // A WAV whose data chunk is empty contains no decodable audio.
+        let mut empty_data = pcm16_wav_fixture();
+        empty_data[40..44].copy_from_slice(&0u32.to_le_bytes());
+        empty_data.truncate(44);
+        let path = root.join("nodata.wav");
+        std::fs::write(&path, &empty_data).unwrap();
+        assert!(decode_audio_file(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn decode_truncated_wave_data_yields_at_most_the_available_frames() {
+        let root = fixture_root();
+        std::fs::create_dir_all(&root).unwrap();
+        // The fixture declares 4 data bytes; keep only 2 (one whole frame).
+        let mut truncated = pcm16_wav_fixture();
+        truncated.truncate(46);
+        let path = root.join("cut.wav");
+        std::fs::write(&path, &truncated).unwrap();
+        if let Ok(decoded) = decode_audio_file(&path) {
+            assert!(decoded.frame_count() <= 1);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn reads_first_wave_sampler_loop_as_half_open_frame_bounds() {
         let root = fixture_root();

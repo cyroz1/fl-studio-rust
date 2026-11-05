@@ -8,6 +8,7 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,6 +35,13 @@ const VST2_TAIL_PROBE_MARKER: &str = "FLP_VST2_TAIL_V1 ";
 const VST2_TAIL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VST2_TAIL_PROBE_STATE_BYTES: usize = 64 * 1024 * 1024 - 9;
 const MAX_VST2_TAIL_PROBE_OUTPUT_BYTES: usize = 16 * 1024;
+const VST2_TAIL_PROBE_FRAMED_ARGUMENT: &str = "v2";
+const VST2_TAIL_PROBE_FRAME_MAGIC: &[u8; 4] = b"FLT2";
+const MAX_VST2_TAIL_PROBE_PARAMETERS: usize = 65_536;
+const MAX_VST2_TAIL_PROBE_INPUT_BYTES: usize = MAX_VST2_TAIL_PROBE_STATE_BYTES
+    + 8
+    + 12 * MAX_VST2_TAIL_PROBE_PARAMETERS
+    + 1;
 const MAX_VST2_MIXER_PARAMETER_HISTORY: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -386,6 +394,46 @@ pub fn run_vst2_worker_if_requested() -> bool {
     }
 }
 
+
+/// Framed tail-probe input: magic, a u32 parameter count, that many
+/// (u32 id, f64 value bits) pairs, then the raw saved plug-in state. The
+/// framed form lets a refresh probe reproduce parameter edits made after the
+/// state was saved; unframed input keeps the original state-only meaning.
+fn encode_vst2_tail_probe_input(state: &[u8], parameters: &[(u32, f64)]) -> Vec<u8> {
+    let mut input = Vec::with_capacity(8 + parameters.len() * 12 + state.len());
+    input.extend_from_slice(VST2_TAIL_PROBE_FRAME_MAGIC);
+    input.extend_from_slice(&(parameters.len() as u32).to_le_bytes());
+    for (parameter_id, value) in parameters {
+        input.extend_from_slice(&parameter_id.to_le_bytes());
+        input.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+    input.extend_from_slice(state);
+    input
+}
+
+fn decode_vst2_tail_probe_input(input: &[u8]) -> Option<(Vec<(u32, f64)>, &[u8])> {
+    let (magic, rest) = input.split_at_checked(4)?;
+    if magic != VST2_TAIL_PROBE_FRAME_MAGIC {
+        return None;
+    }
+    let (count_bytes, rest) = rest.split_at_checked(4)?;
+    let count = u32::from_le_bytes(count_bytes.try_into().ok()?) as usize;
+    if count > MAX_VST2_TAIL_PROBE_PARAMETERS {
+        return None;
+    }
+    let (parameter_bytes, state) = rest.split_at_checked(count.checked_mul(12)?)?;
+    let mut parameters = Vec::with_capacity(count);
+    for entry in parameter_bytes.chunks_exact(12) {
+        let parameter_id = u32::from_le_bytes(entry[..4].try_into().ok()?);
+        let value = f64::from_bits(u64::from_le_bytes(entry[4..12].try_into().ok()?));
+        if !value.is_finite() {
+            return None;
+        }
+        parameters.push((parameter_id, value));
+    }
+    Some((parameters, state))
+}
+
 fn run_vst2_tail_probe_child(
     mut arguments: impl Iterator<Item = std::ffi::OsString>,
 ) -> Result<Option<u32>, String> {
@@ -403,18 +451,33 @@ fn run_vst2_tail_probe_child(
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.parse::<u32>().ok())
         .ok_or_else(|| "invalid VST2 sample rate".to_owned())?;
+    let framed_input = match arguments.next() {
+        None => false,
+        Some(argument) if argument == OsStr::new(VST2_TAIL_PROBE_FRAMED_ARGUMENT) => true,
+        Some(_) => return Err("unexpected VST2 tail probe argument".to_owned()),
+    };
     if arguments.next().is_some() {
         return Err("unexpected VST2 tail probe argument".to_owned());
     }
 
-    let mut state = Vec::new();
+    let mut input = Vec::new();
     std::io::stdin()
-        .take((MAX_VST2_TAIL_PROBE_STATE_BYTES + 1) as u64)
-        .read_to_end(&mut state)
-        .map_err(|error| format!("could not read VST2 plug-in state: {error}"))?;
-    if state.len() > MAX_VST2_TAIL_PROBE_STATE_BYTES {
-        return Err("VST2 plug-in state exceeds the tail probe limit".to_owned());
-    }
+        .take(MAX_VST2_TAIL_PROBE_INPUT_BYTES as u64)
+        .read_to_end(&mut input)
+        .map_err(|error| format!("could not read VST2 tail probe input: {error}"))?;
+    let (parameters, state) = if framed_input {
+        let (parameters, state) = decode_vst2_tail_probe_input(&input)
+            .ok_or_else(|| "invalid framed VST2 tail probe input".to_owned())?;
+        if state.len() > MAX_VST2_TAIL_PROBE_STATE_BYTES {
+            return Err("VST2 plug-in state exceeds the tail probe limit".to_owned());
+        }
+        (parameters, state.to_vec())
+    } else {
+        if input.len() > MAX_VST2_TAIL_PROBE_STATE_BYTES {
+            return Err("VST2 plug-in state exceeds the tail probe limit".to_owned());
+        }
+        (Vec::new(), input)
+    };
 
     let mut plugin =
         vst_audio_worker_sys::plugin::Vst2Plugin::load_class(&plugin_path, Some(class_id))
@@ -426,6 +489,13 @@ fn run_vst2_tail_probe_child(
     plugin
         .configure(sample_rate, RENDER_QUANTUM, info.inputs, info.outputs)
         .map_err(|error| format!("could not configure VST2 plug-in: {error}"))?;
+    for (parameter_id, value) in &parameters {
+        plugin
+            .set_parameter(*parameter_id, *value)
+            .map_err(|error| {
+                format!("could not apply VST2 plug-in parameter {parameter_id}: {error}")
+            })?;
+    }
     plugin.activate();
     Ok(plugin.tail_samples())
 }
@@ -1496,6 +1566,40 @@ fn copy_vst2_mixer_stereo_bus(
     Ok(())
 }
 
+
+/// One-slot hand-off for background VST2 tail refresh probes. The processing
+/// thread publishes parameter revisions; a detached probe thread reports the
+/// refreshed tail for the revision it probed.
+#[derive(Default)]
+struct Vst2TailRefreshShared {
+    in_flight: AtomicBool,
+    result: Mutex<Option<(u64, Option<u64>)>>,
+}
+
+impl Vst2TailRefreshShared {
+    fn take_result(&self) -> Option<(u64, Option<u64>)> {
+        self.result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn store_result(&self, revision: u64, tail_samples: Option<u64>) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((revision, tail_samples));
+    }
+}
+
+fn vst2_tail_refresh_should_start(
+    probed_revision: u64,
+    current_revision: u64,
+    in_flight: bool,
+) -> bool {
+    current_revision > probed_revision && !in_flight
+}
+
 struct Vst2MixerEffectProcessor {
     _instance: Instance,
     audio: AudioEndpoint,
@@ -1509,6 +1613,11 @@ struct Vst2MixerEffectProcessor {
     auxiliary_input_source_map: Option<Vec<(usize, usize)>>,
     latency_samples: u32,
     tail_samples: Option<u64>,
+    tail_assignment: Vst2ProjectMixerEffectAssignment,
+    tail_parameters: BTreeMap<u32, f64>,
+    tail_parameters_revision: u64,
+    tail_probed_revision: u64,
+    tail_refresh: Arc<Vst2TailRefreshShared>,
     startup_fallbacks: usize,
     transport: Transport,
     input_buffers: Vec<Vec<f32>>,
@@ -1528,8 +1637,16 @@ impl Vst2MixerEffectProcessor {
         sample_rate: u32,
         parameter_sync: Vst2MixerEffectParameterSync,
     ) -> Result<Self, String> {
-        let tail_samples = probe_vst2_mixer_effect_tail_samples(assignment, sample_rate);
         let (parameter_sync_revision, pending_parameter_updates) = parameter_sync.snapshot(key);
+        let tail_samples = if pending_parameter_updates.is_empty() {
+            probe_vst2_mixer_effect_tail_samples(assignment, sample_rate)
+        } else {
+            probe_vst2_mixer_effect_tail_samples_with_parameters(
+                assignment,
+                sample_rate,
+                &pending_parameter_updates,
+            )
+        };
         let selected_bus_layout = Arc::new(Mutex::new(None));
         let configuration = Configuration {
             sample_rate,
@@ -1584,6 +1701,11 @@ impl Vst2MixerEffectProcessor {
             auxiliary_input_source_map: assignment.auxiliary_input_source_map.clone(),
             latency_samples,
             tail_samples,
+            tail_assignment: assignment.clone(),
+            tail_parameters: pending_parameter_updates.clone(),
+            tail_parameters_revision: 0,
+            tail_probed_revision: 0,
+            tail_refresh: Arc::new(Vst2TailRefreshShared::default()),
             startup_fallbacks: (latency_samples as usize).div_ceil(quantum),
             transport: Transport::default(),
             input_buffers: vec![vec![0.0; quantum]; bus_layout.input_channels],
@@ -1595,6 +1717,65 @@ impl Vst2MixerEffectProcessor {
             parameter_sync_revision,
             pending_parameter_updates,
         })
+    }
+}
+
+impl Vst2MixerEffectProcessor {
+    /// Records a parameter value this processor has applied to its live
+    /// instance so background tail probes reproduce the current state.
+    fn note_tail_parameter(&mut self, parameter_id: u32, value: f64) {
+        if self.tail_parameters.insert(parameter_id, value) != Some(value) {
+            self.tail_parameters_revision =
+                self.tail_parameters_revision.wrapping_add(1).max(1);
+        }
+    }
+
+    /// Applies any finished tail refresh and, when parameters changed since
+    /// the last probe, starts one detached refresh probe. At most one probe
+    /// runs at a time; changes made during a probe coalesce into the next
+    /// one. A failed probe keeps the previously reported tail.
+    fn refresh_tail_samples_if_needed(&mut self) {
+        if let Some((revision, refreshed)) = self.tail_refresh.take_result() {
+            self.tail_probed_revision = self.tail_probed_revision.max(revision);
+            if let Some(samples) = refreshed {
+                self.tail_samples = Some(samples);
+            }
+        }
+        let in_flight = self.tail_refresh.in_flight.load(Ordering::Acquire);
+        if !vst2_tail_refresh_should_start(
+            self.tail_probed_revision,
+            self.tail_parameters_revision,
+            in_flight,
+        ) {
+            return;
+        }
+        if self
+            .tail_refresh
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let revision = self.tail_parameters_revision;
+        let parameters = self.tail_parameters.clone();
+        let assignment = self.tail_assignment.clone();
+        let sample_rate = self.sample_rate;
+        let shared = Arc::clone(&self.tail_refresh);
+        let spawned = thread::Builder::new()
+            .name("vst2-tail-refresh".to_owned())
+            .spawn(move || {
+                let refreshed = probe_vst2_mixer_effect_tail_samples_with_parameters(
+                    &assignment,
+                    sample_rate,
+                    &parameters,
+                );
+                shared.store_result(revision, refreshed);
+                shared.in_flight.store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.tail_refresh.in_flight.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -1668,6 +1849,9 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
             .updates_since(self.parameter_sync_key, self.parameter_sync_revision)
         {
             self.parameter_sync_revision = revision;
+            for (parameter_id, value) in &updates {
+                self.note_tail_parameter(*parameter_id, *value);
+            }
             self.pending_parameter_updates.extend(updates);
         }
         let remaining_parameter_events = MAX_EVENTS.saturating_sub(parameter_changes.len());
@@ -1695,6 +1879,7 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
             {
                 return Err("VST2 Mixer effect received an invalid parameter change".to_owned());
             }
+            self.note_tail_parameter(*parameter_id, *value);
             self.parameter_events.push(AudioEvent {
                 sample_offset: *sample_offset,
                 bus: 0,
@@ -1782,6 +1967,7 @@ impl MixerEffectProcessor for Vst2MixerEffectProcessor {
             *stereo = [left, right];
         }
         self.transport = self.transport.advanced(frames, self.sample_rate);
+        self.refresh_tail_samples_if_needed();
         Ok(())
     }
 
@@ -1794,6 +1980,36 @@ fn probe_vst2_mixer_effect_tail_samples(
     assignment: &Vst2ProjectMixerEffectAssignment,
     sample_rate: u32,
 ) -> Option<u64> {
+    run_vst2_tail_probe(assignment, sample_rate, None)
+}
+
+/// Probes the tail with the plug-in's current parameter values applied on
+/// top of its saved state, so edits made after the state was saved are
+/// reflected in the reported tail.
+fn probe_vst2_mixer_effect_tail_samples_with_parameters(
+    assignment: &Vst2ProjectMixerEffectAssignment,
+    sample_rate: u32,
+    parameters: &BTreeMap<u32, f64>,
+) -> Option<u64> {
+    if parameters.is_empty() {
+        return probe_vst2_mixer_effect_tail_samples(assignment, sample_rate);
+    }
+    if parameters.len() > MAX_VST2_TAIL_PROBE_PARAMETERS {
+        return None;
+    }
+    let parameters = parameters
+        .iter()
+        .map(|(parameter_id, value)| (*parameter_id, *value))
+        .collect::<Vec<_>>();
+    let input = encode_vst2_tail_probe_input(&assignment.state_bytes, &parameters);
+    run_vst2_tail_probe(assignment, sample_rate, Some(input))
+}
+
+fn run_vst2_tail_probe(
+    assignment: &Vst2ProjectMixerEffectAssignment,
+    sample_rate: u32,
+    framed_input: Option<Vec<u8>>,
+) -> Option<u64> {
     if assignment.state_bytes.len() > MAX_VST2_TAIL_PROBE_STATE_BYTES {
         return None;
     }
@@ -1803,11 +2019,16 @@ fn probe_vst2_mixer_effect_tail_samples(
         .iter()
         .map(|byte| format!("{byte:02X}"))
         .collect::<String>();
-    let mut child = ProcessCommand::new(executable)
+    let mut command = ProcessCommand::new(executable);
+    command
         .arg(VST2_TAIL_PROBE_FLAG)
         .arg(&assignment.plugin_path)
         .arg(class_id)
-        .arg(sample_rate.to_string())
+        .arg(sample_rate.to_string());
+    if framed_input.is_some() {
+        command.arg(VST2_TAIL_PROBE_FRAMED_ARGUMENT);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1818,7 +2039,8 @@ fn probe_vst2_mixer_effect_tail_samples(
         let _ = child.wait();
         return None;
     };
-    if stdin.write_all(&assignment.state_bytes).is_err() {
+    let payload = framed_input.as_deref().unwrap_or(&assignment.state_bytes);
+    if stdin.write_all(payload).is_err() {
         let _ = child.kill();
         let _ = child.wait();
         return None;
@@ -2844,5 +3066,65 @@ fn finite_sample(sample: f32) -> f32 {
         sample.clamp(-1.0, 1.0)
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_probe_framing_round_trips_parameters_and_state() {
+        let state = [9_u8, 8, 7, 6, 5];
+        let parameters = [(3_u32, 0.5_f64), (7, 1.0), (3, 0.25)];
+        let input = encode_vst2_tail_probe_input(&state, &parameters);
+        let (decoded_parameters, decoded_state) =
+            decode_vst2_tail_probe_input(&input).expect("framed input should decode");
+        assert_eq!(decoded_parameters, parameters);
+        assert_eq!(decoded_state, state);
+
+        let empty = encode_vst2_tail_probe_input(&state, &[]);
+        let (decoded_parameters, decoded_state) =
+            decode_vst2_tail_probe_input(&empty).expect("parameterless frame should decode");
+        assert!(decoded_parameters.is_empty());
+        assert_eq!(decoded_state, state);
+    }
+
+    #[test]
+    fn tail_probe_framing_rejects_raw_and_truncated_input() {
+        // Legacy raw state is not framed input.
+        assert!(decode_vst2_tail_probe_input(&[1, 2, 3, 4, 5, 6]).is_none());
+        assert!(decode_vst2_tail_probe_input(&[]).is_none());
+        // A frame cut short inside the parameter block does not parse.
+        let input = encode_vst2_tail_probe_input(&[1, 2], &[(3, 0.5), (7, 1.0)]);
+        assert!(decode_vst2_tail_probe_input(&input[..16]).is_none());
+        // A parameter count beyond the cap does not parse.
+        let mut oversized = Vec::new();
+        oversized.extend_from_slice(VST2_TAIL_PROBE_FRAME_MAGIC);
+        oversized.extend_from_slice(&((MAX_VST2_TAIL_PROBE_PARAMETERS + 1) as u32).to_le_bytes());
+        assert!(decode_vst2_tail_probe_input(&oversized).is_none());
+        // Non-finite parameter values do not parse.
+        let input = encode_vst2_tail_probe_input(&[], &[(3, f64::NAN)]);
+        assert!(decode_vst2_tail_probe_input(&input).is_none());
+    }
+
+    #[test]
+    fn tail_refresh_starts_only_for_unprobed_revisions() {
+        assert!(vst2_tail_refresh_should_start(0, 1, false));
+        assert!(!vst2_tail_refresh_should_start(1, 1, false));
+        assert!(!vst2_tail_refresh_should_start(2, 1, false));
+        assert!(!vst2_tail_refresh_should_start(0, 1, true));
+        assert!(!vst2_tail_refresh_should_start(0, 0, false));
+    }
+
+    #[test]
+    fn tail_refresh_shared_slot_hands_results_back_once() {
+        let shared = Vst2TailRefreshShared::default();
+        assert!(shared.take_result().is_none());
+        shared.store_result(4, Some(12_345));
+        assert_eq!(shared.take_result(), Some((4, Some(12_345))));
+        assert!(shared.take_result().is_none());
+        shared.store_result(5, None);
+        assert_eq!(shared.take_result(), Some((5, None)));
     }
 }

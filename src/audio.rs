@@ -8251,7 +8251,7 @@ impl WasapiSampleSpec {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
     use cpal::SupportedBufferSize;
 
@@ -8261,12 +8261,12 @@ mod tests {
         AudioAccess, AudioDeviceCatalog, AudioDeviceConfigRange, AudioDeviceInfo, AudioEngineEvent,
         AudioErrorState, AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState,
         MixerTrackPeakMeters, ParameterCommand, PlaybackState, ProjectPlaybackClock,
-        STREAM_PREFILL_FRAMES, StagedStreamingPlayback, StereoFrameDelay, StreamEventObserver,
-        TransportCommand, audio_device_config_ranges, buffer_config_preference,
-        create_streaming_playback, enable_denormal_protection, mixer_effect_wet_mix,
-        negotiated_buffer_frames, next_output_frame, output_gain_smoothing_alpha,
-        sanitize_output_sample, smooth_output_gain, tone_sample, valid_project_playback_speed,
-        validate_settings,
+        RetiredArcSwapOption, STREAM_PREFILL_FRAMES, StagedStreamingPlayback, StereoFrameDelay,
+        StreamEventObserver, TransportCommand, audio_device_config_ranges,
+        buffer_config_preference, create_streaming_playback, enable_denormal_protection,
+        mixer_effect_wet_mix, negotiated_buffer_frames, next_output_frame,
+        output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain, tone_sample,
+        valid_project_playback_speed, validate_settings,
     };
 
     #[test]
@@ -8838,6 +8838,95 @@ mod tests {
             f32::from_bits(playback.browser_preview_gain.load(Ordering::Acquire)),
             0.75
         );
+    }
+
+    #[test]
+    fn realtime_command_application_survives_concurrent_control_traffic() {
+        let playback = Arc::new(PlaybackState::new());
+        let source = Arc::new(AtomicU8::new(AUDIO_SOURCE_SILENT));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Callback side: drain both command lanes and attempt streaming
+        // handoffs at callback cadence while the control side floods them.
+        let callback = {
+            let playback = Arc::clone(&playback);
+            let source = Arc::clone(&source);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut passes = 0_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    playback.apply_pending_commands(&source);
+                    playback.apply_pending_streaming_handoff();
+                    passes += 1;
+                }
+                passes
+            })
+        };
+        let control = {
+            let playback = Arc::clone(&playback);
+            std::thread::spawn(move || {
+                for index in 0..20_000_u32 {
+                    let next_source = if index.is_multiple_of(2) {
+                        AUDIO_SOURCE_TEST_TONE
+                    } else {
+                        AUDIO_SOURCE_INPUT_MONITOR
+                    };
+                    playback
+                        .enqueue_transport_command(TransportCommand::SetOutputSource(next_source));
+                    playback.enqueue_parameter_command(
+                        ParameterCommand::SetBrowserPreviewGain((index as f32).to_bits()),
+                    );
+                }
+                // The last enqueued values are the newest state and must win.
+                playback.enqueue_transport_command(TransportCommand::SetOutputSource(
+                    AUDIO_SOURCE_PROJECT,
+                ));
+                playback.enqueue_parameter_command(ParameterCommand::SetBrowserPreviewGain(
+                    0.5_f32.to_bits(),
+                ));
+            })
+        };
+        control.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        let passes = callback.join().unwrap();
+        assert!(passes > 0);
+
+        playback.apply_pending_commands(&source);
+        assert_eq!(source.load(Ordering::Acquire), AUDIO_SOURCE_PROJECT);
+        assert_eq!(
+            f32::from_bits(playback.browser_preview_gain.load(Ordering::Acquire)),
+            0.5
+        );
+    }
+
+    #[test]
+    fn retired_arc_swap_keeps_guards_valid_while_stores_churn() {
+        let slot = Arc::new(RetiredArcSwapOption::<Vec<f32>>::new());
+        slot.store(Some(Arc::new(vec![1.0])));
+        let writer = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                for index in 0..5_000_u32 {
+                    slot.store(Some(Arc::new(vec![index as f32])));
+                }
+                slot.store(None);
+            })
+        };
+        let reader = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                for _ in 0..5_000 {
+                    let guard = slot.load();
+                    if let Some(value) = guard.as_deref() {
+                        assert_eq!(value.len(), 1);
+                        assert!(value[0].is_finite());
+                    }
+                }
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+        assert!(slot.load().is_none());
     }
 
     #[test]
