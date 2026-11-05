@@ -4991,6 +4991,7 @@ enum BrowserFilter {
     Audio,
     Projects,
     Presets,
+    Midi,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5002,7 +5003,7 @@ enum BrowserFileKind {
 }
 
 impl BrowserFilter {
-    const ALL: [Self; 4] = [Self::All, Self::Audio, Self::Projects, Self::Presets];
+    const ALL: [Self; 5] = [Self::All, Self::Audio, Self::Projects, Self::Presets, Self::Midi];
 
     fn label(self) -> &'static str {
         match self {
@@ -5010,6 +5011,7 @@ impl BrowserFilter {
             Self::Audio => "Samples",
             Self::Projects => "Projects",
             Self::Presets => "Presets",
+            Self::Midi => "MIDI",
         }
     }
 }
@@ -42516,15 +42518,13 @@ impl DawUi {
                             .speed(0.1),
                     )
                     .changed();
-                if !has_opaque_tail {
-                    item_flags_changed = ui
-                        .add(
-                            egui::DragValue::new(&mut item_flags)
-                                .prefix("Flags raw ")
-                                .speed(0.1),
-                        )
-                        .changed();
-                }
+                item_flags_changed = ui
+                    .add(
+                        egui::DragValue::new(&mut item_flags)
+                            .prefix("Flags raw ")
+                            .speed(0.1),
+                    )
+                    .changed();
             });
             if !has_opaque_tail {
                 ui.horizontal_wrapped(|ui| {
@@ -95524,6 +95524,7 @@ fn browser_search_filter_key(filter: BrowserFilter) -> &'static str {
         BrowserFilter::Audio => "audio",
         BrowserFilter::Projects => "projects",
         BrowserFilter::Presets => "presets",
+        BrowserFilter::Midi => "midi",
     }
 }
 
@@ -95533,6 +95534,7 @@ fn parse_browser_search_filter(value: &str) -> Option<BrowserFilter> {
         "audio" => Some(BrowserFilter::Audio),
         "projects" => Some(BrowserFilter::Projects),
         "presets" => Some(BrowserFilter::Presets),
+        "midi" => Some(BrowserFilter::Midi),
         _ => None,
     }
 }
@@ -95817,6 +95819,7 @@ fn browser_filter_matches(path: &Path, filter: BrowserFilter) -> bool {
             | (BrowserFilter::Audio, Some(BrowserFileKind::Audio))
             | (BrowserFilter::Projects, Some(BrowserFileKind::Project))
             | (BrowserFilter::Presets, Some(BrowserFileKind::Preset))
+            | (BrowserFilter::Midi, Some(BrowserFileKind::Midi))
     )
 }
 
@@ -100604,7 +100607,50 @@ mod tests {
         upsert_playlist_vst3_mixer_effect_parameter_link, upsert_playlist_vst3_parameter_link,
         zoom_to_fit,
     };
-    use super::{BrowserPreviewPreferences, browser_sampler_root_key_for_preview};
+    use super::{
+        BrowserFilter, BrowserPreviewPreferences, browser_filter_matches,
+        browser_sampler_root_key_for_preview, browser_search_filter_key,
+        parse_browser_search_filter,
+    };
+
+    #[test]
+    fn browser_file_filter_covers_every_recognized_kind() {
+        let cases = [
+            ("kick.wav", BrowserFilter::Audio),
+            ("song.flp", BrowserFilter::Projects),
+            ("project.zip", BrowserFilter::Projects),
+            ("lead.fst", BrowserFilter::Presets),
+            ("melody.mid", BrowserFilter::Midi),
+            ("melody.midi", BrowserFilter::Midi),
+        ];
+        for (name, expected_filter) in cases {
+            let path = PathBuf::from(name);
+            assert!(browser_filter_matches(&path, BrowserFilter::All), "{name}");
+            assert!(
+                browser_filter_matches(&path, expected_filter),
+                "{name} should match its own filter"
+            );
+            for filter in BrowserFilter::ALL {
+                if filter != BrowserFilter::All && filter != expected_filter {
+                    assert!(
+                        !browser_filter_matches(&path, filter),
+                        "{name} should not match {filter:?}"
+                    );
+                }
+            }
+        }
+        assert!(!browser_filter_matches(
+            &PathBuf::from("notes.txt"),
+            BrowserFilter::All
+        ));
+        for filter in BrowserFilter::ALL {
+            assert_eq!(
+                parse_browser_search_filter(browser_search_filter_key(filter)),
+                Some(filter),
+                "filter keys should round-trip"
+            );
+        }
+    }
 
     #[test]
     fn browser_preview_preferences_round_trip_and_reject_invalid_values() {
