@@ -20582,6 +20582,39 @@ impl DawUi {
                     self.merge_selected_playlist_pattern_clips();
                     ui.close();
                 }
+                ui.separator();
+                let can_select_playlist_clips =
+                    self.view == MainView::Playlist && self.document.is_some();
+                if ui
+                    .add_enabled(
+                        can_select_playlist_clips,
+                        egui::Button::new("Select all Playlist clips  Ctrl/Cmd+A"),
+                    )
+                    .clicked()
+                {
+                    self.select_all_playlist_clips();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        can_select_playlist_clips,
+                        egui::Button::new("Invert Playlist clip selection  Shift+I"),
+                    )
+                    .clicked()
+                {
+                    self.invert_playlist_clip_selection();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        can_select_playlist_clips,
+                        egui::Button::new("Deselect Playlist clips  Ctrl/Cmd+D"),
+                    )
+                    .clicked()
+                {
+                    self.deselect_playlist_clips();
+                    ui.close();
+                }
             });
             ui.menu_button("Add", |ui| {
                 if ui
