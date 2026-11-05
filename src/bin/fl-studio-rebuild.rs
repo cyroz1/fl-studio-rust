@@ -4995,6 +4995,39 @@ enum BrowserFilter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PluginFormatFilter {
+    All,
+    Vst2,
+    Vst3,
+    Clap,
+    AudioUnit,
+}
+
+impl PluginFormatFilter {
+    const ALL: [Self; 5] = [Self::All, Self::Vst2, Self::Vst3, Self::Clap, Self::AudioUnit];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All formats",
+            Self::Vst2 => "VST2",
+            Self::Vst3 => "VST3",
+            Self::Clap => "CLAP",
+            Self::AudioUnit => "Audio Unit",
+        }
+    }
+}
+
+fn plugin_candidate_matches_format(candidate: &PluginCandidate, filter: PluginFormatFilter) -> bool {
+    match filter {
+        PluginFormatFilter::All => true,
+        PluginFormatFilter::Vst2 => candidate.format == PluginFormat::Vst2Candidate,
+        PluginFormatFilter::Vst3 => candidate.format == PluginFormat::Vst3,
+        PluginFormatFilter::Clap => candidate.format == PluginFormat::Clap,
+        PluginFormatFilter::AudioUnit => candidate.format == PluginFormat::AudioUnitCandidate,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserFileKind {
     Audio,
     Project,
@@ -6257,6 +6290,7 @@ struct DawUi {
     pending_playlist_audio_drops: VecDeque<PendingPlaylistAudioDrop>,
     browser_tab: BrowserTab,
     browser_filter: BrowserFilter,
+    browser_plugin_format_filter: PluginFormatFilter,
     browser_path: PathBuf,
     browser_visible: bool,
     browser_font_scale: f32,
@@ -9894,6 +9928,7 @@ impl DawUi {
             pending_playlist_audio_drops: VecDeque::new(),
             browser_tab: BrowserTab::Files,
             browser_filter: BrowserFilter::All,
+            browser_plugin_format_filter: PluginFormatFilter::All,
             browser_path,
             browser_visible: load_browser_visibility(),
             browser_font_scale: 1.0,
@@ -32940,10 +32975,23 @@ impl DawUi {
                 .hint_text("Find installed plug-ins")
                 .desired_width(f32::INFINITY),
         );
+        egui::ComboBox::from_id_salt("browser-plugin-format-filter")
+            .selected_text(self.browser_plugin_format_filter.label())
+            .show_ui(ui, |ui| {
+                for filter in PluginFormatFilter::ALL {
+                    ui.selectable_value(
+                        &mut self.browser_plugin_format_filter,
+                        filter,
+                        filter.label(),
+                    );
+                }
+            });
         let query = self.browser_search.to_lowercase();
+        let format_filter = self.browser_plugin_format_filter;
         let candidates = self
             .plugin_candidates
             .iter()
+            .filter(|candidate| plugin_candidate_matches_format(candidate, format_filter))
             .filter(|candidate| {
                 query.is_empty()
                     || candidate.name.to_lowercase().contains(&query)
@@ -100608,9 +100656,9 @@ mod tests {
         zoom_to_fit,
     };
     use super::{
-        BrowserFilter, BrowserPreviewPreferences, browser_filter_matches,
+        BrowserFilter, BrowserPreviewPreferences, PluginFormatFilter, browser_filter_matches,
         browser_sampler_root_key_for_preview, browser_search_filter_key,
-        parse_browser_search_filter,
+        parse_browser_search_filter, plugin_candidate_matches_format,
     };
 
     #[test]
@@ -100649,6 +100697,45 @@ mod tests {
                 Some(filter),
                 "filter keys should round-trip"
             );
+        }
+    }
+
+    #[test]
+    fn browser_plugin_format_filter_matches_each_candidate_format() {
+        let candidate = |format: PluginFormat| PluginCandidate {
+            format,
+            name: "Example".to_owned(),
+            path: PathBuf::from("/plugins/example"),
+            class_ids: Vec::new(),
+            audio_unit_components: Vec::new(),
+        };
+        let cases = [
+            (PluginFormat::Vst2Candidate, PluginFormatFilter::Vst2),
+            (PluginFormat::Vst3, PluginFormatFilter::Vst3),
+            (PluginFormat::Clap, PluginFormatFilter::Clap),
+            (
+                PluginFormat::AudioUnitCandidate,
+                PluginFormatFilter::AudioUnit,
+            ),
+        ];
+        for (format, expected_filter) in cases {
+            let candidate = candidate(format);
+            assert!(plugin_candidate_matches_format(
+                &candidate,
+                PluginFormatFilter::All
+            ));
+            assert!(
+                plugin_candidate_matches_format(&candidate, expected_filter),
+                "{format} should match its own filter"
+            );
+            for filter in PluginFormatFilter::ALL {
+                if filter != PluginFormatFilter::All && filter != expected_filter {
+                    assert!(
+                        !plugin_candidate_matches_format(&candidate, filter),
+                        "{format} should not match {filter:?}"
+                    );
+                }
+            }
         }
     }
 
