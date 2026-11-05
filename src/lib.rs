@@ -47148,6 +47148,91 @@ mod tests {
     }
 
     #[test]
+    fn layer_note_router_terminates_on_self_referencing_layers() {
+        // A Layer that lists itself as a child must not recurse forever; the
+        // self edge is dropped and the real children still receive the note.
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        for child in [0_u16, 1] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 0, 0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("self-referencing Layer fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        assert_eq!(router.targets_for_note(0, 0, 60), vec![1]);
+
+        // A Layer whose only child is itself routes nowhere.
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        event_stream.push(0x5E);
+        event_stream.extend_from_slice(&0u16.to_le_bytes());
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("self-only Layer fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        assert!(router.targets_for_note(0, 0, 60).is_empty());
+    }
+
+    #[test]
+    fn layer_note_router_terminates_on_mutually_referencing_layers() {
+        // Layer 0 -> Layer 1 -> {Layer 0, Sampler 2}: the back edge into the
+        // already-active Layer 0 is dropped from both directions.
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        event_stream.push(0x5E);
+        event_stream.extend_from_slice(&1u16.to_le_bytes());
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 3, 0x90]);
+        event_stream.extend_from_slice(&0u32.to_le_bytes());
+        for child in [0_u16, 2] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        event_stream.extend_from_slice(&[0x40, 2, 0, 0x15, 0, 0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("mutual Layer fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        assert_eq!(router.targets_for_note(0, 0, 60), vec![2]);
+        assert_eq!(router.targets_for_note(1, 0, 60), vec![2]);
+    }
+
+    #[test]
+    fn layer_note_router_composes_nested_random_layer_choices() {
+        // Random Layer 0 picks between Random Layer 1 (children 3 and 4) and
+        // Sampler 2. Every note lands on exactly one leaf, choices repeat per
+        // seed, and all three leaves are reachable.
+        let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
+        event_stream.extend_from_slice(&1u32.to_le_bytes());
+        for child in [1_u16, 2] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        event_stream.extend_from_slice(&[0x40, 1, 0, 0x15, 3, 0x90]);
+        event_stream.extend_from_slice(&1u32.to_le_bytes());
+        for child in [3_u16, 4] {
+            event_stream.push(0x5E);
+            event_stream.extend_from_slice(&child.to_le_bytes());
+        }
+        for channel_id in [2_u8, 3, 4] {
+            event_stream.extend_from_slice(&[0x40, channel_id, 0, 0x15, 0]);
+        }
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        let document = FlpDocument::parse(&flp_fixture(&event_stream, &[], &[]))
+            .expect("nested random Layer fixture should parse");
+        let router = ChannelNoteRouter::new(document.channels());
+        let choices = (0..64)
+            .map(|seed| {
+                let targets = router.targets_for_note(0, seed, 60);
+                assert_eq!(targets.len(), 1, "seed {seed}");
+                assert_eq!(router.targets_for_note(0, seed, 60), targets);
+                targets[0]
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(choices, [2, 3, 4].into_iter().collect());
+    }
+
+    #[test]
     fn note_router_applies_source_and_child_key_regions_before_random_selection() {
         let mut event_stream = vec![0x40, 0, 0, 0x15, 3, 0x90];
         event_stream.extend_from_slice(&1u32.to_le_bytes());
