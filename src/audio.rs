@@ -2723,6 +2723,10 @@ struct AudioCommandQueue {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TransportCommand {
     SetOutputSource(u8),
+    /// Pause or resume the streaming transport (Pattern, Playlist, and Performance
+    /// playback). The generation identifies the stream the request was issued for, so a
+    /// command queued for a replaced stream cannot pause or resume its replacement.
+    SetStreamingPaused { generation: u64, paused: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2735,6 +2739,9 @@ struct StreamingProducerState {
 }
 
 struct StreamingPlayback {
+    /// Monotonic identity used to keep queued transport commands aimed at the stream they
+    /// were issued for after that stream has been replaced.
+    generation: u64,
     rings: Vec<AudioRingBuffer>,
     producer_finished: Vec<AtomicBool>,
     producer_underrun_frames: Vec<AtomicU64>,
@@ -2821,7 +2828,9 @@ fn create_streaming_playback(
     project_source: bool,
 ) -> (Arc<StreamingPlayback>, Vec<StreamingAudioWriter>) {
     assert!((1..=MAX_LIVE_STREAM_SOURCES).contains(&source_count));
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
     let playback = Arc::new(StreamingPlayback {
+        generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         rings: (0..MAX_LIVE_STREAM_SOURCES)
             .map(|index| {
                 let capacity = if index < source_count {
@@ -3404,12 +3413,22 @@ impl PlaybackState {
 
     fn apply_pending_commands(&self, source: &AtomicU8) {
         for _ in 0..AUDIO_COMMAND_QUEUE_CAPACITY {
-            let Some(TransportCommand::SetOutputSource(next_source)) =
-                self.commands.transport.pop()
-            else {
+            let Some(command) = self.commands.transport.pop() else {
                 break;
             };
-            source.store(next_source, Ordering::Release);
+            match command {
+                TransportCommand::SetOutputSource(next_source) => {
+                    source.store(next_source, Ordering::Release);
+                }
+                TransportCommand::SetStreamingPaused { generation, paused } => {
+                    if let Some(streaming) = self.streaming.load().as_deref()
+                        && streaming.generation == generation
+                    {
+                        streaming.paused.store(paused, Ordering::Release);
+                        streaming.active.store(!paused, Ordering::Release);
+                    }
+                }
+            }
         }
         for _ in 0..AUDIO_COMMAND_QUEUE_CAPACITY {
             let Some(ParameterCommand::SetBrowserPreviewGain(gain_bits)) =
@@ -3815,8 +3834,13 @@ impl PlaybackState {
     fn pause(&self) {
         self.active.store(false, Ordering::Release);
         if let Some(streaming) = self.streaming.load().as_deref() {
-            streaming.active.store(false, Ordering::Release);
-            streaming.paused.store(true, Ordering::Release);
+            // Streaming transport pause travels through the command queue so the audio
+            // callback applies it at a block boundary, like output source changes.
+            // AudioEngine settles the queue itself while no callback is running.
+            self.enqueue_transport_command(TransportCommand::SetStreamingPaused {
+                generation: streaming.generation,
+                paused: true,
+            });
         }
     }
 
@@ -3835,8 +3859,12 @@ impl PlaybackState {
             if streaming.cancelled.load(Ordering::Acquire) || stream_exhausted {
                 return Err("No streamed project audio remains to resume".to_owned());
             }
-            streaming.paused.store(false, Ordering::Release);
-            streaming.active.store(true, Ordering::Release);
+            // Resume is validated here, then travels through the command queue so the
+            // audio callback applies it at a block boundary, like a pause request.
+            self.enqueue_transport_command(TransportCommand::SetStreamingPaused {
+                generation: streaming.generation,
+                paused: false,
+            });
             return Ok(());
         }
         let frame_count = self
@@ -5132,6 +5160,12 @@ impl AudioEngine {
 
     pub fn pause_project_playback(&self) {
         self.playback.pause();
+        if !self.output_active {
+            // No device callback is draining the command queue, so the control thread
+            // settles the queued transport state itself, mirroring how output source
+            // requests are stored directly while output is inactive.
+            self.playback.apply_pending_commands(&self.source);
+        }
         self.stop_playback_source();
     }
 
@@ -8771,6 +8805,76 @@ mod tests {
     }
 
     #[test]
+    fn streaming_pause_and_resume_travel_through_the_command_queue() {
+        let playback = PlaybackState::new();
+        let writer = playback.start_streaming(0);
+        writer.write_stereo_samples(&[0.25, -0.5]).unwrap();
+        let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
+        let stream = playback.streaming.load();
+        let streaming = stream.as_deref().unwrap();
+        assert!(!streaming.paused.load(Ordering::Acquire));
+
+        playback.pause();
+        assert!(
+            !streaming.paused.load(Ordering::Acquire),
+            "pause stays queued until the callback applies it"
+        );
+        playback.apply_pending_commands(&source);
+        assert!(streaming.paused.load(Ordering::Acquire));
+        assert!(!streaming.active.load(Ordering::Acquire));
+
+        playback.resume().unwrap();
+        assert!(
+            streaming.paused.load(Ordering::Acquire),
+            "resume stays queued until the callback applies it"
+        );
+        playback.apply_pending_commands(&source);
+        assert!(!streaming.paused.load(Ordering::Acquire));
+        assert!(streaming.active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn queued_streaming_pause_does_not_pause_a_replacement_stream() {
+        let playback = PlaybackState::new();
+        let _writer = playback.start_streaming(0);
+        let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
+
+        playback.pause();
+        playback.stop();
+        let _replacement = playback.start_streaming(0);
+        playback.apply_pending_commands(&source);
+
+        let stream = playback.streaming.load();
+        let streaming = stream.as_deref().unwrap();
+        assert!(!streaming.paused.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn full_audio_command_queue_keeps_the_newest_streaming_pause_state() {
+        let playback = PlaybackState::new();
+        let _writer = playback.start_streaming(0);
+        let source = AtomicU8::new(AUDIO_SOURCE_STREAM);
+        // Alternate resume/pause requests past capacity, then finish with a pause.
+        // Resume validation reads the stream directly, so every request is accepted
+        // even while earlier requests are still queued.
+        for index in 0..AUDIO_COMMAND_QUEUE_CAPACITY + 16 {
+            if index % 2 == 0 {
+                playback.resume().unwrap();
+            } else {
+                playback.pause();
+            }
+        }
+        playback.pause();
+        playback.apply_pending_commands(&source);
+
+        let stream = playback.streaming.load();
+        assert!(
+            stream.as_deref().unwrap().paused.load(Ordering::Acquire),
+            "the newest queued transport state wins when the queue overflows"
+        );
+    }
+
+    #[test]
     fn input_monitor_outputs_captured_stereo_channels() {
         let ring = AudioRingBuffer::new(4);
         assert!(ring.push_stereo_frame(0.25, -0.5));
@@ -9323,6 +9427,8 @@ mod tests {
         let mut phase = 0.0;
 
         playback.pause();
+        // The device callback applies queued transport commands before each block.
+        playback.apply_pending_commands(&source);
         assert_eq!(
             next_output_frame(
                 &source,
@@ -9341,6 +9447,7 @@ mod tests {
         );
 
         playback.resume().unwrap();
+        playback.apply_pending_commands(&source);
         assert_eq!(
             next_output_frame(
                 &source,
