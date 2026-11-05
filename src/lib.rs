@@ -42536,6 +42536,269 @@ mod tests {
         assert_eq!(notes[4].channel_id, 1);
     }
 
+    fn zero_randomizer_options() -> RandomizerOptions {
+        RandomizerOptions {
+            seed: 0,
+            velocity_amount_percent: 0,
+            pan_amount_percent: 0,
+            release_amount_percent: 0,
+            mod_x_amount_percent: 0,
+            mod_y_amount_percent: 0,
+            pitch_range_semitones: 0,
+            bipolar: false,
+            reset_levels: false,
+        }
+    }
+
+    fn note_record_with_levels(
+        position: u32,
+        channel: u16,
+        length: u32,
+        key: u16,
+        velocity: u8,
+        pan: u8,
+        release: u8,
+        mod_x: u8,
+        mod_y: u8,
+    ) -> [u8; 24] {
+        let note = PatternNote {
+            position,
+            channel_id: channel,
+            length,
+            key,
+            velocity,
+            pan,
+            release,
+            mod_x,
+            mod_y,
+            ..PatternNote::default()
+        };
+        let mut record = [0; 24];
+        note.encode_into(&mut record);
+        record
+    }
+
+    #[test]
+    fn randomizer_randomizes_every_level_property_deterministically() {
+        let full_options = RandomizerOptions {
+            seed: 7,
+            velocity_amount_percent: 100,
+            pan_amount_percent: 100,
+            release_amount_percent: 100,
+            mod_x_amount_percent: 100,
+            mod_y_amount_percent: 100,
+            pitch_range_semitones: 12,
+            bipolar: true,
+            reset_levels: false,
+        };
+        let mut records: Vec<[u8; 24]> = (0..8_u16)
+            .map(|index| note_record(u32::from(index) * 96, 0, 96, 60 + index, 90))
+            .collect();
+        records.push(note_record(0, 1, 96, 61, 90));
+        let input = pattern_fixture(&records, &[0xFF, 0]);
+
+        let mut first = FlpDocument::parse(&input).expect("fixture should parse");
+        let changed = first
+            .randomize_pattern_notes(7, 0, full_options)
+            .expect("randomizer should succeed");
+        assert_eq!(changed, 8);
+        let mut second = FlpDocument::parse(&input).expect("fixture should parse");
+        second
+            .randomize_pattern_notes(7, 0, full_options)
+            .expect("randomizer should succeed");
+        assert_eq!(
+            first.encode_lossless().unwrap(),
+            second.encode_lossless().unwrap()
+        );
+
+        let mut different = full_options;
+        different.seed = 8;
+        let mut other_seed = FlpDocument::parse(&input).expect("fixture should parse");
+        other_seed
+            .randomize_pattern_notes(7, 0, different)
+            .expect("randomizer should succeed");
+        assert_ne!(
+            first.encode_lossless().unwrap(),
+            other_seed.encode_lossless().unwrap()
+        );
+
+        let notes = first.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes.len(), 9);
+        let mut altered_properties = 0_usize;
+        for (index, note) in notes.iter().take(8).enumerate() {
+            assert_eq!(note.position, index as u32 * 96);
+            assert_eq!(note.length, 96);
+            assert!((i32::from(note.key) - (60 + index as i32)).abs() <= 12);
+            assert!(note.pan <= 127);
+            assert!(note.release <= 192);
+            altered_properties += usize::from(note.velocity != 90)
+                + usize::from(note.pan != 64)
+                + usize::from(note.release != 64)
+                + usize::from(note.mod_x != 128)
+                + usize::from(note.mod_y != 128)
+                + usize::from(note.key != 60 + index as u16);
+        }
+        // Every randomized property must show movement somewhere across the
+        // eight notes; with fixed seeds this is an exact expectation.
+        assert!(altered_properties >= 8, "altered {altered_properties}");
+        let untouched = &notes[8];
+        assert_eq!(untouched.channel_id, 1);
+        assert_eq!(untouched.key, 61);
+        assert_eq!(untouched.velocity, 90);
+        assert_eq!(untouched.pan, 64);
+        assert_eq!(untouched.release, 64);
+        assert_eq!(untouched.mod_x, 128);
+        assert_eq!(untouched.mod_y, 128);
+
+        // Seed zero falls back to a fixed seed and stays deterministic too.
+        let mut zero_options = full_options;
+        zero_options.seed = 0;
+        let mut zero_first = FlpDocument::parse(&input).expect("fixture should parse");
+        zero_first
+            .randomize_pattern_notes(7, 0, zero_options)
+            .expect("randomizer should succeed");
+        let mut zero_second = FlpDocument::parse(&input).expect("fixture should parse");
+        zero_second
+            .randomize_pattern_notes(7, 0, zero_options)
+            .expect("randomizer should succeed");
+        assert_eq!(
+            zero_first.encode_lossless().unwrap(),
+            zero_second.encode_lossless().unwrap()
+        );
+    }
+
+    #[test]
+    fn randomizer_one_way_amounts_only_move_levels_in_that_direction() {
+        let records: Vec<[u8; 24]> = (0..16_u32)
+            .map(|index| note_record_with_levels(index * 96, 0, 96, 60, 80, 64, 64, 128, 128))
+            .collect();
+        let input = pattern_fixture(&records, &[0xFF, 0]);
+        let one_way = |velocity: i16, pan: i16| RandomizerOptions {
+            seed: 3,
+            velocity_amount_percent: velocity,
+            pan_amount_percent: pan,
+            bipolar: false,
+            ..zero_randomizer_options()
+        };
+
+        let mut lowered = FlpDocument::parse(&input).expect("fixture should parse");
+        lowered
+            .randomize_pattern_notes(7, 0, one_way(-100, 0))
+            .expect("randomizer should succeed");
+        let notes = lowered.patterns().unwrap().remove(0).notes;
+        assert!(notes.iter().all(|note| note.velocity <= 80));
+        assert!(notes.iter().any(|note| note.velocity < 80));
+
+        let mut raised = FlpDocument::parse(&input).expect("fixture should parse");
+        raised
+            .randomize_pattern_notes(7, 0, one_way(0, 100))
+            .expect("randomizer should succeed");
+        let notes = raised.patterns().unwrap().remove(0).notes;
+        assert!(notes.iter().all(|note| note.pan >= 64));
+        assert!(notes.iter().any(|note| note.pan > 64));
+
+        // With bipolar enabled a negative amount may move either side of the
+        // starting level, so at least one note must end up above it.
+        let mut bipolar = one_way(-100, 0);
+        bipolar.bipolar = true;
+        let mut mixed = FlpDocument::parse(&input).expect("fixture should parse");
+        mixed
+            .randomize_pattern_notes(7, 0, bipolar)
+            .expect("randomizer should succeed");
+        let notes = mixed.patterns().unwrap().remove(0).notes;
+        assert!(notes.iter().any(|note| note.velocity > 80));
+        assert!(notes.iter().all(|note| note.velocity <= 127));
+    }
+
+    #[test]
+    fn randomizer_reset_levels_rebases_from_the_neutral_defaults() {
+        let input = pattern_fixture(
+            &[
+                note_record_with_levels(0, 0, 96, 60, 30, 10, 20, 40, 200),
+                note_record_with_levels(96, 0, 96, 62, 120, 110, 90, 220, 30),
+            ],
+            &[0xFF, 0],
+        );
+
+        // Zero amounts without reset change nothing at all.
+        let idle = zero_randomizer_options();
+        let mut untouched = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = untouched.encode_lossless().unwrap();
+        assert_eq!(
+            untouched
+                .randomize_pattern_notes(7, 0, idle)
+                .expect("randomizer should succeed"),
+            0
+        );
+        assert_eq!(untouched.encode_lossless().unwrap(), before);
+
+        // With reset, every level is rebuilt from its neutral default even
+        // when all amounts are zero; keys stay put.
+        let mut reset = idle;
+        reset.reset_levels = true;
+        let mut project = FlpDocument::parse(&input).expect("fixture should parse");
+        assert_eq!(
+            project
+                .randomize_pattern_notes(7, 0, reset)
+                .expect("randomizer should succeed"),
+            2
+        );
+        let notes = project.patterns().unwrap().remove(0).notes;
+        for (note, expected_key) in notes.iter().zip([60, 62]) {
+            assert_eq!(note.key, expected_key);
+            assert_eq!(note.velocity, 100);
+            assert_eq!(note.pan, 64);
+            assert_eq!(note.release, 64);
+            assert_eq!(note.mod_x, 128);
+            assert_eq!(note.mod_y, 128);
+        }
+    }
+
+    #[test]
+    fn randomizer_selection_limits_changes_and_errors_do_not_mutate() {
+        let records: Vec<[u8; 24]> = (0..4_u32)
+            .map(|index| note_record(index * 96, 0, 96, 60, 90))
+            .collect();
+        let input = pattern_fixture(&records, &[0xFF, 0]);
+        let options = RandomizerOptions {
+            seed: 5,
+            velocity_amount_percent: 100,
+            bipolar: true,
+            ..zero_randomizer_options()
+        };
+        let mut project = FlpDocument::parse(&input).expect("fixture should parse");
+        let changed = project
+            .randomize_pattern_note_selection(7, 0, &[1, 3], options)
+            .expect("randomizer should succeed");
+        assert!((1..=2).contains(&changed));
+        let notes = project.patterns().unwrap().remove(0).notes;
+        assert_eq!(notes[0].velocity, 90);
+        assert_eq!(notes[2].velocity, 90);
+        assert!(notes[1].velocity != 90 || notes[3].velocity != 90);
+
+        // Out-of-range amounts, pitch ranges, and missing patterns are
+        // rejected before anything is written back.
+        for invalid in [
+            RandomizerOptions {
+                velocity_amount_percent: 101,
+                ..options
+            },
+            RandomizerOptions {
+                pitch_range_semitones: 25,
+                ..options
+            },
+        ] {
+            let mut project = FlpDocument::parse(&input).expect("fixture should parse");
+            let before = project.encode_lossless().unwrap();
+            assert!(project.randomize_pattern_notes(7, 0, invalid).is_err());
+            assert_eq!(project.encode_lossless().unwrap(), before);
+        }
+        let mut project = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = project.encode_lossless().unwrap();
+        assert!(project.randomize_pattern_notes(99, 0, options).is_err());
+        assert_eq!(project.encode_lossless().unwrap(), before);
+    }
+
     #[test]
     fn riff_machine_levels_randomize_all_supported_note_properties_deterministically() {
         let mut first_root = note_record(0, 0, 96, 60, 80);
