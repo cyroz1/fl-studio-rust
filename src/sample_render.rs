@@ -21510,8 +21510,11 @@ struct SamplerVoiceEngine<'a> {
     voices_stolen: usize,
     pitch_bend_cents: [i16; 16],
     live_midi_pan: [f32; 16],
+    live_midi_pan_current: [f32; 16],
     live_midi_channel_volume: [f32; 16],
+    live_midi_channel_volume_current: [f32; 16],
     live_midi_expression: [f32; 16],
+    live_midi_expression_current: [f32; 16],
     live_midi_mod_x: [u8; 16],
     live_midi_mod_y: [u8; 16],
     sustain_down: [bool; 16],
@@ -21656,6 +21659,25 @@ fn set_sampler_voice_source_step(voice: &mut SamplerVoice, pitch_bend_cents: i16
         * slide_ratio;
 }
 
+/// Live MIDI channel controls (volume, expression, and pan) ramp linearly over
+/// this window instead of jumping in one frame, matching the 20 ms dezippering
+/// used for Mixer controls. At very low render sample rates the window is a
+/// single frame, so the control still lands immediately.
+const LIVE_CONTROL_SMOOTHING_SECONDS: f64 = 0.02;
+
+fn live_control_smoothing_frames(sample_rate: u32) -> usize {
+    ((f64::from(sample_rate.max(1)) * LIVE_CONTROL_SMOOTHING_SECONDS).round() as usize).max(1)
+}
+
+fn advance_smoothed_live_control(current: f32, target: f32, full_range: f32, frames: usize) -> f32 {
+    let step = full_range / frames.max(1) as f32;
+    if current < target {
+        (current + step).min(target)
+    } else {
+        (current - step).max(target)
+    }
+}
+
 impl<'a> SamplerVoiceEngine<'a> {
     #[cfg(test)]
     fn new(
@@ -21730,8 +21752,11 @@ impl<'a> SamplerVoiceEngine<'a> {
             voices_stolen: 0,
             pitch_bend_cents: [0; 16],
             live_midi_pan: [64.0; 16],
+            live_midi_pan_current: [64.0; 16],
             live_midi_channel_volume: [1.0; 16],
+            live_midi_channel_volume_current: [1.0; 16],
             live_midi_expression: [1.0; 16],
+            live_midi_expression_current: [1.0; 16],
             live_midi_mod_x: [128; 16],
             live_midi_mod_y: [128; 16],
             sustain_down: [false; 16],
@@ -21942,9 +21967,34 @@ impl<'a> SamplerVoiceEngine<'a> {
         let pitch_bend_cents = self.pitch_bend_cents;
         let live_midi_channel_volume = self.live_midi_channel_volume;
         let live_midi_expression = self.live_midi_expression;
+        let live_midi_pan = self.live_midi_pan;
+        let mut live_midi_channel_volume_current = self.live_midi_channel_volume_current;
+        let mut live_midi_expression_current = self.live_midi_expression_current;
+        let mut live_midi_pan_current = self.live_midi_pan_current;
+        let live_control_frames = live_control_smoothing_frames(self.output_sample_rate);
         let mut last_active_output_frame = None;
         for offset in 0..frame_count {
             let frame = block_start + offset as u64;
+            for channel in 0..16 {
+                live_midi_channel_volume_current[channel] = advance_smoothed_live_control(
+                    live_midi_channel_volume_current[channel],
+                    live_midi_channel_volume[channel],
+                    1.0,
+                    live_control_frames,
+                );
+                live_midi_expression_current[channel] = advance_smoothed_live_control(
+                    live_midi_expression_current[channel],
+                    live_midi_expression[channel],
+                    1.0,
+                    live_control_frames,
+                );
+                live_midi_pan_current[channel] = advance_smoothed_live_control(
+                    live_midi_pan_current[channel],
+                    live_midi_pan[channel],
+                    127.0,
+                    live_control_frames,
+                );
+            }
             let current_tick = (self.tempo_synced_modulations
                 || self.voices.iter().any(|voice| {
                     voice.as_ref().is_some_and(|voice| {
@@ -22117,6 +22167,21 @@ impl<'a> SamplerVoiceEngine<'a> {
                     None
                 };
                 if render_samples {
+                    if voice.note_slide.is_none()
+                        && let Some(channel) = voice.input_midi_channel
+                    {
+                        let pan = live_midi_pan_current[usize::from(channel)];
+                        if voice.note_pan_value != pan {
+                            voice.note_pan_value = pan;
+                            let effective_pan =
+                                sampler_note_pan_value(voice.channel_pan, voice.note_pan_value);
+                            (voice.left_gain, voice.right_gain) = channel_pan_gains(
+                                effective_pan,
+                                voice.source.channels.len() == 1,
+                                pan_law,
+                            );
+                        }
+                    }
                     if voice.pan_lfo.is_some() || voice.pan_envelope.is_some() {
                         let envelope_context = SamplerEnvelopeFrameContext {
                             started_frame: voice.started_frame,
@@ -22157,8 +22222,8 @@ impl<'a> SamplerVoiceEngine<'a> {
                         .clamp(0.0, 2.0)
                     });
                     let midi_gain = voice.input_midi_channel.map_or(1.0, |channel| {
-                        live_midi_expression[usize::from(channel)]
-                            * live_midi_channel_volume[usize::from(channel)]
+                        live_midi_expression_current[usize::from(channel)]
+                            * live_midi_channel_volume_current[usize::from(channel)]
                     });
                     let gain = voice.gain * envelope_gain * lfo_gain * midi_gain * fade;
                     let mut routed_frame = [
@@ -22249,6 +22314,9 @@ impl<'a> SamplerVoiceEngine<'a> {
             }
         }
         self.current_frame = block_start.saturating_add(frame_count as u64);
+        self.live_midi_channel_volume_current = live_midi_channel_volume_current;
+        self.live_midi_expression_current = live_midi_expression_current;
+        self.live_midi_pan_current = live_midi_pan_current;
         last_active_output_frame
     }
 
@@ -22790,7 +22858,16 @@ impl<'a> SamplerVoiceEngine<'a> {
     fn apply_live_pan_position(&mut self, channel: u8, pan: f32) {
         let channel = channel & 0x0F;
         let pan = pan.clamp(0.0, 127.0);
+        // Only the target changes here. The render loop eases each active
+        // voice's pan from the smoothed current value toward this target over
+        // the 20 ms dezippering window instead of jumping in one frame.
         self.live_midi_pan[usize::from(channel)] = pan;
+    }
+
+    fn sync_voice_pan_to_live_target(&mut self, channel: u8) {
+        let channel = channel & 0x0F;
+        let pan = self.live_midi_pan[usize::from(channel)];
+        self.live_midi_pan_current[usize::from(channel)] = pan;
         let sources_by_channel = &self.sources_by_channel;
         let pan_law = self.pan_law;
         for voice in self.voices.iter_mut().filter_map(Option::as_mut) {
@@ -22806,9 +22883,9 @@ impl<'a> SamplerVoiceEngine<'a> {
     }
 
     fn refresh_live_pan_for_channel(&mut self, channel: u8) {
-        let channel = channel & 0x0F;
-        let pan = self.live_midi_pan[usize::from(channel)];
-        self.apply_live_pan_position(channel, pan);
+        // A voice that was just assigned to this MIDI channel starts from the
+        // channel's current pan immediately; later pan changes ramp.
+        self.sync_voice_pan_to_live_target(channel);
     }
 
     fn apply_live_expression(&mut self, channel: u8, value: u8) {
@@ -30548,6 +30625,109 @@ mod tests {
                 .abs()
                 < 1e-6
         );
+    }
+
+    #[test]
+    fn sampler_live_volume_and_pan_ramp_over_twenty_milliseconds() {
+        let sources = HashMap::from([(
+            7,
+            SamplerVoiceSource {
+                sampler_filter: None,
+                audio: Arc::new(DecodedAudio {
+                    sample_rate: 48_000,
+                    channels: vec![vec![1.0; 8192]],
+                }),
+                gain: 1.0,
+                pan: 0.0,
+                reverse: false,
+                volume_envelope_enabled: false,
+                volume_envelope: None,
+                max_polyphony_raw: None,
+                mono_enabled: false,
+                portamento_enabled: false,
+                polyphony_slide_raw: None,
+                channel_cut_groups: None,
+                fast_declick_for_cut_groups: false,
+                key_range: None,
+                velocity_range: None,
+                root_key: SAMPLER_ROOT_KEY,
+                fine_tune_cents: 0.0,
+                loop_bounds: None,
+                ping_pong_loop: false,
+                backward_loop: false,
+                release_loop_bounds: None,
+                release_ping_pong_loop: false,
+                pan_envelope: None,
+                pitch_envelope: None,
+                pan_lfo: None,
+                volume_lfo: None,
+                pitch_lfo: None,
+            },
+        )]);
+        let mut engine = SamplerVoiceEngine::new(&sources, &[], 2, 4, 48_000);
+        let slot_index = engine
+            .start_voice(ScheduledSamplerNote {
+                clip_index: 0,
+                playlist_track_id: None,
+                start_tick: 0,
+                stop_tick: None,
+                start_frame: 0,
+                stop_frame: None,
+                channel_id: 7,
+                key: SAMPLER_ROOT_KEY,
+                midi_channel: 0,
+                slide_note: false,
+                slide_duration_frames: 0,
+                velocity: 127,
+                mod_x: 128,
+                mod_y: 128,
+                pan: 64,
+                fine_pitch_offset_cents: 0,
+                layer_gain: 1.0,
+                layer_pan_raw: 0,
+            })
+            .expect("live voice should start");
+        engine.set_voice_input_midi_channel(slot_index, 2);
+
+        let full_pan_gain = std::f32::consts::FRAC_1_SQRT_2;
+        let mut frame = [0.0; 2];
+        engine.render_block(0, 1, &mut frame);
+        assert!((frame[0] - full_pan_gain).abs() < 1e-6);
+        assert!((frame[1] - full_pan_gain).abs() < 1e-6);
+
+        // A volume change to zero must ramp over the 960-frame (20 ms at
+        // 48 kHz) dezippering window instead of muting in a single frame.
+        engine.apply_live_channel_volume(2, 0);
+        engine.render_block(1, 1, &mut frame);
+        let first_ramped_gain = full_pan_gain * (1.0 - 1.0 / 960.0);
+        assert!((frame[0] - first_ramped_gain).abs() < 1e-5);
+        assert!(frame[0] > full_pan_gain * 0.99);
+        let mut block = vec![0.0; 479 * 2];
+        engine.render_block(2, 479, &mut block);
+        let halfway_gain = full_pan_gain * 0.5;
+        assert!((block[block.len() - 2] - halfway_gain).abs() < 1e-4);
+        let mut block = vec![0.0; 481 * 2];
+        engine.render_block(481, 481, &mut block);
+        assert_eq!(block[block.len() - 2], 0.0);
+        assert_eq!(engine.live_midi_channel_volume_current[2], 0.0);
+
+        // Pan changes ramp the same way: one frame after a hard-right target
+        // the voice is still essentially centered, and after the full window
+        // it lands on the target gains.
+        engine.apply_live_channel_volume(2, 127);
+        let mut block = vec![0.0; 961 * 2];
+        engine.render_block(962, 961, &mut block);
+        assert!((block[block.len() - 2] - full_pan_gain).abs() < 1e-6);
+        engine.apply_live_pan(2, 127);
+        engine.render_block(1923, 1, &mut frame);
+        assert!(frame[0] > full_pan_gain * 0.99);
+        let mut block = vec![0.0; 960 * 2];
+        engine.render_block(1924, 960, &mut block);
+        let expected =
+            channel_pan_gains(sampler_note_pan_value(0.0, 127.0), true, PanLaw::Circular);
+        assert!((block[block.len() - 2] - expected.0).abs() < 1e-5);
+        assert!((block[block.len() - 1] - expected.1).abs() < 1e-5);
+        assert_eq!(engine.live_midi_pan_current[2], 127.0);
     }
 
     #[test]
