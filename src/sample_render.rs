@@ -26048,12 +26048,9 @@ mod tests {
             pattern_id,
             ..SamplerPatternRenderOptions::default()
         };
-        let (_, limited) = render_sampler_pattern_to_stereo_buffer(
-            &document,
-            &project_path,
-            options,
-        )
-        .expect("limited render should succeed");
+        let (_, limited) =
+            render_sampler_pattern_to_stereo_buffer(&document, &project_path, options)
+                .expect("limited render should succeed");
         assert_eq!(limited.voices_stolen, 1);
 
         let (_, unlimited) = render_sampler_pattern_to_stereo_buffer(

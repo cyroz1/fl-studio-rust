@@ -37,11 +37,12 @@ const MAX_VST2_TAIL_PROBE_STATE_BYTES: usize = 64 * 1024 * 1024 - 9;
 const MAX_VST2_TAIL_PROBE_OUTPUT_BYTES: usize = 16 * 1024;
 const VST2_TAIL_PROBE_FRAMED_ARGUMENT: &str = "v2";
 const VST2_TAIL_PROBE_FRAME_MAGIC: &[u8; 4] = b"FLT2";
+
+/// Parameter id/value pairs carried by a framed VST2 tail probe request.
+type Vst2TailProbeParameters = Vec<(u32, f64)>;
 const MAX_VST2_TAIL_PROBE_PARAMETERS: usize = 65_536;
-const MAX_VST2_TAIL_PROBE_INPUT_BYTES: usize = MAX_VST2_TAIL_PROBE_STATE_BYTES
-    + 8
-    + 12 * MAX_VST2_TAIL_PROBE_PARAMETERS
-    + 1;
+const MAX_VST2_TAIL_PROBE_INPUT_BYTES: usize =
+    MAX_VST2_TAIL_PROBE_STATE_BYTES + 8 + 12 * MAX_VST2_TAIL_PROBE_PARAMETERS + 1;
 const MAX_VST2_MIXER_PARAMETER_HISTORY: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -394,7 +395,6 @@ pub fn run_vst2_worker_if_requested() -> bool {
     }
 }
 
-
 /// Framed tail-probe input: magic, a u32 parameter count, that many
 /// (u32 id, f64 value bits) pairs, then the raw saved plug-in state. The
 /// framed form lets a refresh probe reproduce parameter edits made after the
@@ -411,7 +411,7 @@ fn encode_vst2_tail_probe_input(state: &[u8], parameters: &[(u32, f64)]) -> Vec<
     input
 }
 
-fn decode_vst2_tail_probe_input(input: &[u8]) -> Option<(Vec<(u32, f64)>, &[u8])> {
+fn decode_vst2_tail_probe_input(input: &[u8]) -> Option<(Vst2TailProbeParameters, &[u8])> {
     let (magic, rest) = input.split_at_checked(4)?;
     if magic != VST2_TAIL_PROBE_FRAME_MAGIC {
         return None;
@@ -423,7 +423,7 @@ fn decode_vst2_tail_probe_input(input: &[u8]) -> Option<(Vec<(u32, f64)>, &[u8])
     }
     let (parameter_bytes, state) = rest.split_at_checked(count.checked_mul(12)?)?;
     let mut parameters = Vec::with_capacity(count);
-    for entry in parameter_bytes.chunks_exact(12) {
+    for entry in parameter_bytes.as_chunks::<12>().0 {
         let parameter_id = u32::from_le_bytes(entry[..4].try_into().ok()?);
         let value = f64::from_bits(u64::from_le_bytes(entry[4..12].try_into().ok()?));
         if !value.is_finite() {
@@ -1566,7 +1566,6 @@ fn copy_vst2_mixer_stereo_bus(
     Ok(())
 }
 
-
 /// One-slot hand-off for background VST2 tail refresh probes. The processing
 /// thread publishes parameter revisions; a detached probe thread reports the
 /// refreshed tail for the revision it probed.
@@ -1725,8 +1724,7 @@ impl Vst2MixerEffectProcessor {
     /// instance so background tail probes reproduce the current state.
     fn note_tail_parameter(&mut self, parameter_id: u32, value: f64) {
         if self.tail_parameters.insert(parameter_id, value) != Some(value) {
-            self.tail_parameters_revision =
-                self.tail_parameters_revision.wrapping_add(1).max(1);
+            self.tail_parameters_revision = self.tail_parameters_revision.wrapping_add(1).max(1);
         }
     }
 

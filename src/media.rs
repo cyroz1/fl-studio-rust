@@ -566,7 +566,11 @@ fn raised_cosine_ramp(frequency_hz: f64, start_hz: f64, end_hz: f64) -> f64 {
     }
 }
 
-fn spectral_band_gain_channel(samples: &[f32], sample_rate: u32, band: SpectralBandGain) -> Vec<f32> {
+fn spectral_band_gain_channel(
+    samples: &[f32],
+    sample_rate: u32,
+    band: SpectralBandGain,
+) -> Vec<f32> {
     let frame_count = samples.len();
     let window = SPECTRAL_WINDOW_FRAMES;
     let hop = SPECTRAL_HOP_FRAMES;
@@ -598,11 +602,7 @@ fn spectral_band_gain_channel(samples: &[f32], sample_rate: u32, band: SpectralB
         }
         fft_in_place(&mut real, &mut imaginary, false);
         for bin in 0..window {
-            let mirror = if bin <= window / 2 {
-                bin
-            } else {
-                window - bin
-            };
+            let mirror = if bin <= window / 2 { bin } else { window - bin };
             let frequency = f64::from(mirror as u32) * f64::from(sample_rate) / window as f64;
             let factor = spectral_band_gain_factor(band, frequency) as f32;
             real[bin] *= factor;
@@ -652,8 +652,7 @@ fn fft_in_place(real: &mut [f32], imaginary: &mut [f32], inverse: bool) {
     }
     let mut stage_size = 2;
     while stage_size <= len {
-        let angle =
-            (if inverse { 2.0 } else { -2.0 }) * std::f64::consts::PI / stage_size as f64;
+        let angle = (if inverse { 2.0 } else { -2.0 }) * std::f64::consts::PI / stage_size as f64;
         let step_real = angle.cos();
         let step_imaginary = angle.sin();
         for stage_start in (0..len).step_by(stage_size) {
@@ -2797,10 +2796,9 @@ mod tests {
         for (offset, &sample) in samples[start..start + measure_len].iter().enumerate() {
             let window = 0.5
                 - 0.5
-                    * (2.0 * std::f64::consts::PI * offset as f64 / (measure_len - 1) as f64)
-                        .cos();
-            let angle = 2.0 * std::f64::consts::PI * frequency_hz * offset as f64
-                / f64::from(sample_rate);
+                    * (2.0 * std::f64::consts::PI * offset as f64 / (measure_len - 1) as f64).cos();
+            let angle =
+                2.0 * std::f64::consts::PI * frequency_hz * offset as f64 / f64::from(sample_rate);
             real += f64::from(sample) * window * angle.cos();
             imaginary -= f64::from(sample) * window * angle.sin();
             window_sum += window;
@@ -2960,7 +2958,12 @@ mod tests {
 
         let preview = process_audio_range_to_stereo_preview(&audio, 0..48_000, options, 48_000)
             .expect("spectral selection should preview");
-        let preview_mono: Vec<f32> = preview.chunks_exact(2).map(|frame| frame[0]).collect();
+        let preview_mono: Vec<f32> = preview
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|frame| frame[0])
+            .collect();
         let preview_high = tone_magnitude(&preview_mono, 48_000, 4_000.0);
         let preview_change_db = 20.0 * (preview_high / before_high).log10();
         assert!(
@@ -3166,7 +3169,7 @@ mod tests {
         let preview = decoded_audio_to_stereo_samples(&quad, 8_000, None)
             .expect("a four-channel source should preview");
         assert_eq!(preview.len(), 16);
-        for frame in preview.chunks_exact(2) {
+        for frame in preview.as_chunks::<2>().0 {
             assert!((frame[0] - 0.6).abs() < 1e-6, "left folds channels 0 and 2");
             assert!(
                 (frame[1] + 0.2).abs() < 1e-6,
@@ -3187,7 +3190,7 @@ mod tests {
         };
         let preview = decoded_audio_to_stereo_samples(&surround, 8_000, None)
             .expect("a six-channel source should preview");
-        for frame in preview.chunks_exact(2) {
+        for frame in preview.as_chunks::<2>().0 {
             assert!((frame[0] - 0.4).abs() < 1e-6);
             assert!((frame[1] + 0.1).abs() < 1e-6);
         }
@@ -3198,7 +3201,13 @@ mod tests {
         };
         let preview = decoded_audio_to_stereo_samples(&mono, 8_000, None)
             .expect("a mono source should preview");
-        assert!(preview.chunks_exact(2).all(|frame| frame == [0.5, 0.5]));
+        assert!(
+            preview
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|frame| frame[0] == 0.5 && frame[1] == 0.5)
+        );
 
         let stereo = DecodedAudio {
             sample_rate: 8_000,
@@ -3206,7 +3215,13 @@ mod tests {
         };
         let preview = decoded_audio_to_stereo_samples(&stereo, 8_000, None)
             .expect("a stereo source should preview");
-        assert!(preview.chunks_exact(2).all(|frame| frame == [0.25, -0.25]));
+        assert!(
+            preview
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|frame| frame[0] == 0.25 && frame[1] == -0.25)
+        );
     }
 
     #[test]

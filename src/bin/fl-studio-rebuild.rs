@@ -137,10 +137,10 @@ use vst3_host::midi::{MidiChannel as Vst3MidiChannel, MidiEvent as Vst3MidiEvent
 mod audio_unit_probe;
 #[path = "fl-studio-rebuild/clap_probe.rs"]
 mod clap_probe;
-mod midi_input;
-mod midi_output;
 #[path = "fl-studio-rebuild/edison_script.rs"]
 mod edison_script;
+mod midi_input;
+mod midi_output;
 #[path = "fl-studio-rebuild/midi_script.rs"]
 mod midi_script;
 #[path = "fl-studio-rebuild/midi_thru.rs"]
@@ -5512,7 +5512,6 @@ struct PendingEdisonScript {
 struct EdisonScriptDialogState {
     script_path: PathBuf,
     script_name: String,
-    editor_path: PathBuf,
     spec: EdisonScriptDialogSpec,
     values: std::collections::BTreeMap<String, f64>,
 }
@@ -21229,9 +21228,7 @@ impl DawUi {
                 ui.separator();
                 if ui
                     .checkbox(&mut self.touch_controls, "Touch-sized controls")
-                    .on_hover_text(
-                        "Larger buttons, checkboxes, and sliders for touch screens",
-                    )
+                    .on_hover_text("Larger buttons, checkboxes, and sliders for touch screens")
                     .changed()
                     && let Err(error) = save_touch_controls(self.touch_controls)
                 {
@@ -31997,8 +31994,7 @@ impl DawUi {
                                     editor.waveform = waveform;
                                     editor.selection_start =
                                         editor.selection_start.min(frame_count);
-                                    editor.selection_end =
-                                        editor.selection_end.min(frame_count);
+                                    editor.selection_end = editor.selection_end.min(frame_count);
                                     if editor.selection_end <= editor.selection_start {
                                         editor.selection_start = 0;
                                         editor.selection_end = frame_count;
@@ -32029,14 +32025,10 @@ impl DawUi {
                     }
                 }
                 Ok(EdisonScriptRunOutcome::DialogRequested { dialog }) => {
-                    self.status = format!(
-                        "Edison script {} needs input",
-                        pending.script_name
-                    );
+                    self.status = format!("Edison script {} needs input", pending.script_name);
                     self.edison_script_dialog = Some(EdisonScriptDialogState {
                         script_path: pending.script_path,
                         script_name: pending.script_name,
-                        editor_path: pending.editor_path,
                         values: dialog.default_values(),
                         spec: dialog,
                     });
@@ -32072,9 +32064,7 @@ impl DawUi {
                 .resizable(true)
                 .default_size(Vec2::new(520.0, 300.0))
                 .show(ctx, |ui| {
-                    ui.label(
-                        "The script stopped with an error. The sample was not changed.",
-                    );
+                    ui.label("The script stopped with an error. The sample was not changed.");
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.label(egui::RichText::new(&error.error).monospace().small());
                     });
@@ -32114,9 +32104,8 @@ impl DawUi {
                         .or_insert(input.default);
                     match input.kind {
                         EdisonScriptInputKind::Combo => {
-                            let selected = (*value as usize).min(
-                                input.options.len().saturating_sub(1),
-                            );
+                            let selected =
+                                (*value as usize).min(input.options.len().saturating_sub(1));
                             let mut chosen = selected;
                             egui::ComboBox::from_label(&input.name)
                                 .selected_text(
@@ -32488,9 +32477,7 @@ impl DawUi {
         }
         if let Some(script) = run_script_choice {
             self.start_edison_script(script.path, script.name, None, ctx);
-        } else if run_last_script
-            && let Some(path) = self.edison_last_script_path.clone()
-        {
+        } else if run_last_script && let Some(path) = self.edison_last_script_path.clone() {
             let name = path
                 .file_stem()
                 .map(|stem| stem.to_string_lossy().into_owned())
@@ -33489,8 +33476,7 @@ impl DawUi {
                             ui.selectable_label(selected, label)
                         };
                         let clicked = response.clicked();
-                        let middle_clicked =
-                            response.clicked_by(egui::PointerButton::Middle);
+                        let middle_clicked = response.clicked_by(egui::PointerButton::Middle);
                         let double_clicked = response.double_clicked();
                         let start_fraction = if clicked
                             && !entry.is_directory
@@ -33937,8 +33923,7 @@ impl DawUi {
                             format!("★ {name}"),
                         );
                         let clicked = response.clicked();
-                        let middle_clicked =
-                            response.clicked_by(egui::PointerButton::Middle);
+                        let middle_clicked = response.clicked_by(egui::PointerButton::Middle);
                         let double_clicked = response.double_clicked();
                         let start_fraction = if clicked
                             && browser_file_kind(&path) == Some(BrowserFileKind::Audio)
@@ -101421,19 +101406,18 @@ mod tests {
         TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
         Vst3PlaylistParameterAutomation, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
         apply_touch_controls_spacing, audio_recording_start_tick_with_offset,
-        browser_audio_drop_tempo_sync,
-        built_in_midi_controller_templates, candidate_live_mixer_send_key,
-        candidate_matches_vst_identity, candidate_mixer_controls,
+        browser_audio_drop_tempo_sync, built_in_midi_controller_templates,
+        candidate_live_mixer_send_key, candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detached_placement_with_visible_position,
-        detect_chord_name, detect_piano_roll_channel_scale,
-        detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
-        encode_midi_output_routes, first_available_playlist_track,
-        internal_lfo_parameter_automation, internal_lfo_parameter_link_for_target,
-        internal_lfo_value_at_phase, is_performance_clip_trigger_channel_event,
-        live_playlist_vst3_note_targets, midi_button_press_edge, midi_cc_to_mixer_fader_raw,
-        midi_cc_to_mixer_pan_raw, midi_cc_to_mixer_stereo_separation_raw,
-        midi_controller_binding_for_device, midi_mixer_button_press_edge,
-        midi_mixer_control_for_cc, midi_script_arrangement_time_ticks, midi_script_bar_beat,
+        detect_chord_name, detect_piano_roll_channel_scale, detect_piano_roll_scale,
+        encode_midi_device_id, encode_midi_device_selections, encode_midi_output_routes,
+        first_available_playlist_track, internal_lfo_parameter_automation,
+        internal_lfo_parameter_link_for_target, internal_lfo_value_at_phase,
+        is_performance_clip_trigger_channel_event, live_playlist_vst3_note_targets,
+        midi_button_press_edge, midi_cc_to_mixer_fader_raw, midi_cc_to_mixer_pan_raw,
+        midi_cc_to_mixer_stereo_separation_raw, midi_controller_binding_for_device,
+        midi_mixer_button_press_edge, midi_mixer_control_for_cc,
+        midi_script_arrangement_time_ticks, midi_script_bar_beat,
         midi_script_clip_selection_bounds, midi_script_increment_playlist_performance_mode,
         midi_script_marker_jump_target, midi_script_marker_selection_target,
         midi_script_mixer_recording_file_names, midi_script_moved_song_position_tick,

@@ -8873,9 +8873,9 @@ mod tests {
                     };
                     playback
                         .enqueue_transport_command(TransportCommand::SetOutputSource(next_source));
-                    playback.enqueue_parameter_command(
-                        ParameterCommand::SetBrowserPreviewGain((index as f32).to_bits()),
-                    );
+                    playback.enqueue_parameter_command(ParameterCommand::SetBrowserPreviewGain(
+                        (index as f32).to_bits(),
+                    ));
                 }
                 // The last enqueued values are the newest state and must win.
                 playback.enqueue_transport_command(TransportCommand::SetOutputSource(

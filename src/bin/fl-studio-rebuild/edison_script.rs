@@ -735,7 +735,7 @@ mod engine_tests {
         // Editor selection 1..3 (end exclusive) is FL's inclusive 1..2.
         let (sample, _, _) =
             completed(run_edison_script(&script, &stereo_sample(), 1, 3, None).unwrap());
-        assert_eq!(sample.channels[0], vec![0.15000001, 0.4, 0.6, 0.4]);
+        assert_eq!(sample.channels[0], vec![0.15, 0.4, 0.6, 0.4]);
         assert_eq!(sample.channels[1], vec![-0.1, -0.4, -0.6, -0.4]);
         assert_eq!(sample.sample_rate, 8_000);
     }

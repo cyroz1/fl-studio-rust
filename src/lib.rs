@@ -42830,6 +42830,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn note_record_with_levels(
         position: u32,
         channel: u16,
@@ -44054,7 +44055,11 @@ mod tests {
             ..PatternNote::default()
         };
 
-        assert!(document.add_pattern_notes(99, &[note.clone()]).is_err());
+        assert!(
+            document
+                .add_pattern_notes(99, std::slice::from_ref(&note))
+                .is_err()
+        );
         let missing_channel = PatternNote {
             channel_id: 9,
             ..note.clone()
