@@ -5004,7 +5004,13 @@ enum PluginFormatFilter {
 }
 
 impl PluginFormatFilter {
-    const ALL: [Self; 5] = [Self::All, Self::Vst2, Self::Vst3, Self::Clap, Self::AudioUnit];
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Vst2,
+        Self::Vst3,
+        Self::Clap,
+        Self::AudioUnit,
+    ];
 
     fn label(self) -> &'static str {
         match self {
@@ -5017,7 +5023,10 @@ impl PluginFormatFilter {
     }
 }
 
-fn plugin_candidate_matches_format(candidate: &PluginCandidate, filter: PluginFormatFilter) -> bool {
+fn plugin_candidate_matches_format(
+    candidate: &PluginCandidate,
+    filter: PluginFormatFilter,
+) -> bool {
     match filter {
         PluginFormatFilter::All => true,
         PluginFormatFilter::Vst2 => candidate.format == PluginFormat::Vst2Candidate,
@@ -5036,7 +5045,13 @@ enum BrowserFileKind {
 }
 
 impl BrowserFilter {
-    const ALL: [Self; 5] = [Self::All, Self::Audio, Self::Projects, Self::Presets, Self::Midi];
+    const ALL: [Self; 5] = [
+        Self::All,
+        Self::Audio,
+        Self::Projects,
+        Self::Presets,
+        Self::Midi,
+    ];
 
     fn label(self) -> &'static str {
         match self {

@@ -2753,7 +2753,10 @@ mod tests {
         assert_eq!(preview.len(), 16);
         for frame in preview.chunks_exact(2) {
             assert!((frame[0] - 0.6).abs() < 1e-6, "left folds channels 0 and 2");
-            assert!((frame[1] + 0.2).abs() < 1e-6, "right folds channels 1 and 3");
+            assert!(
+                (frame[1] + 0.2).abs() < 1e-6,
+                "right folds channels 1 and 3"
+            );
         }
 
         let surround = DecodedAudio {

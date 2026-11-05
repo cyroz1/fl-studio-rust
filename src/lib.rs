@@ -34184,8 +34184,7 @@ mod tests {
         assert_eq!(document.encode_lossless().unwrap(), before_rejected_edit);
 
         for (clip, expected_tail) in clips[0].clips.iter().zip(&original_tails) {
-            let stored_flags =
-                u16::from_le_bytes([expected_tail[2], expected_tail[3]]);
+            let stored_flags = u16::from_le_bytes([expected_tail[2], expected_tail[3]]);
             assert_eq!(
                 clip.item_flags, stored_flags,
                 "the modern record flags word should decode from offset 18"
