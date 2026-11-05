@@ -485,6 +485,18 @@ fn install_ui_visuals(context: &egui::Context) {
     });
 }
 
+/// Minimum control sizes used when touch-sized controls are enabled, so
+/// buttons, checkboxes, and sliders stay easy to hit on a touch screen.
+/// Idempotent: applying it to an already touch-sized style changes nothing.
+fn apply_touch_controls_spacing(style: &mut egui::Style) {
+    let spacing = &mut style.spacing;
+    spacing.interact_size.x = spacing.interact_size.x.max(44.0);
+    spacing.interact_size.y = spacing.interact_size.y.max(40.0);
+    spacing.button_padding.x = spacing.button_padding.x.max(12.0);
+    spacing.button_padding.y = spacing.button_padding.y.max(10.0);
+    spacing.slider_rail_height = spacing.slider_rail_height.max(8.0);
+}
+
 fn apply_local_ui_scale(ui: &mut egui::Ui, scale: f32) {
     if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < f32::EPSILON {
         return;
@@ -6047,6 +6059,8 @@ struct DawUi {
     soloed_playlist_track_range: Option<(u32, u32)>,
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     hide_collapsed_playlist_groups: bool,
+    touch_controls: bool,
+    touch_controls_style_applied: bool,
     playlist_zero_crossing_splits: bool,
     playlist_edit_patterns_in: PlaylistEditPatternsIn,
     playlist_clip_focus: PlaylistClipFocus,
@@ -9326,6 +9340,7 @@ impl DawUi {
         let piano_roll_note_grouping_enabled = load_piano_roll_note_grouping_enabled();
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
+        let touch_controls = load_touch_controls();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
         let playlist_show_fade_gain_previews = load_playlist_show_fade_gain_previews();
         let playlist_pattern_color_mode = load_playlist_pattern_color_mode();
@@ -9685,6 +9700,8 @@ impl DawUi {
             soloed_playlist_track_range: None,
             collapsed_playlist_groups: BTreeSet::new(),
             hide_collapsed_playlist_groups,
+            touch_controls,
+            touch_controls_style_applied: false,
             playlist_edit_patterns_in,
             playlist_clip_focus: PlaylistClipFocus::default(),
             playlist_pattern_color_mode,
@@ -20993,6 +21010,17 @@ impl DawUi {
                         }
                     }
                 });
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.touch_controls, "Touch-sized controls")
+                    .on_hover_text(
+                        "Larger buttons, checkboxes, and sliders for touch screens",
+                    )
+                    .changed()
+                    && let Err(error) = save_touch_controls(self.touch_controls)
+                {
+                    self.status = format!("Could not save touch controls setting: {error}");
+                }
             });
             ui.menu_button("Tools", |ui| {
                 if ui.button("Channel Rack Graph Editor").clicked() {
@@ -84533,6 +84561,17 @@ impl eframe::App for DawUi {
         ui.ctx().set_theme(egui::Theme::Dark);
         let dark_style = ui.ctx().global_style();
         ui.set_style(dark_style);
+        // Apply or remove the touch-sized control metrics on the shared
+        // style whenever the persisted setting changes (including the first
+        // frame of a launch that starts with the setting enabled).
+        if self.touch_controls_style_applied != self.touch_controls {
+            self.touch_controls_style_applied = self.touch_controls;
+            let mut style = egui::Style::default();
+            if self.touch_controls {
+                apply_touch_controls_spacing(&mut style);
+            }
+            ui.ctx().set_style_of(egui::Theme::Dark, style);
+        }
         // The root Ui can be created before a native backend reports its
         // system theme. Keep its widget visuals on the app palette as well.
         *ui.visuals_mut() = app_visuals();
@@ -94326,6 +94365,31 @@ fn load_hide_collapsed_playlist_groups() -> bool {
         .unwrap_or(true)
 }
 
+fn touch_controls_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("touch-controls.txt"))
+}
+
+fn load_touch_controls() -> bool {
+    touch_controls_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_touch_controls(enabled: bool) -> Result<(), String> {
+    let path = touch_controls_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the touch controls settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn save_hide_collapsed_playlist_groups(enabled: bool) -> Result<(), String> {
     let path = hide_collapsed_playlist_groups_settings_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -100672,7 +100736,8 @@ mod tests {
         PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture,
         TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
         Vst3PlaylistParameterAutomation, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, browser_audio_drop_tempo_sync,
+        apply_touch_controls_spacing, audio_recording_start_tick_with_offset,
+        browser_audio_drop_tempo_sync,
         built_in_midi_controller_templates, candidate_live_mixer_send_key,
         candidate_matches_vst_identity, candidate_mixer_controls,
         candidate_mixer_stereo_separation, detached_placement_with_visible_position,
@@ -106059,6 +106124,24 @@ mod tests {
         )
         .expect("placement should survive the check");
         assert_eq!(checked.position, None);
+    }
+
+    #[test]
+    fn touch_controls_spacing_raises_minimums_and_is_idempotent() {
+        let mut style = eframe::egui::Style::default();
+        let defaults = style.spacing.clone();
+        apply_touch_controls_spacing(&mut style);
+        assert!(style.spacing.interact_size.x >= 44.0);
+        assert!(style.spacing.interact_size.y >= 40.0);
+        assert!(style.spacing.button_padding.x >= 12.0);
+        assert!(style.spacing.button_padding.y >= 10.0);
+        assert!(style.spacing.slider_rail_height >= 8.0);
+        assert!(style.spacing.interact_size.x >= defaults.interact_size.x);
+        let once = style.spacing.clone();
+        apply_touch_controls_spacing(&mut style);
+        assert_eq!(style.spacing.interact_size, once.interact_size);
+        assert_eq!(style.spacing.button_padding, once.button_padding);
+        assert_eq!(style.spacing.slider_rail_height, once.slider_rail_height);
     }
 
     #[test]
