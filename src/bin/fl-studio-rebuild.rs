@@ -6540,6 +6540,7 @@ struct DawUi {
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
     playlist_render_tail_mode: PlaylistTailMode,
+    playlist_render_disable_maximum_polyphony: bool,
     playlist_render_include_plugin_tails: bool,
 }
 
@@ -10199,6 +10200,7 @@ impl DawUi {
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
             playlist_render_tail_mode: PlaylistTailMode::LeaveRemainder,
+            playlist_render_disable_maximum_polyphony: false,
             playlist_render_include_plugin_tails: false,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention, backup_directory)) =
@@ -15861,6 +15863,11 @@ impl DawUi {
                             }
                         });
                 });
+                ui.checkbox(
+                    &mut self.playlist_render_disable_maximum_polyphony,
+                    "Disable maximum polyphony",
+                )
+                .on_hover_text("Ignores the Max poly setting in Miscellaneous Channel Settings for this render. The Mono option is not ignored.");
                 if self.playlist_render_mixer_stems {
                     ui.label("Mixer stems use the selected base tail; reported instrument and effect tails can extend the render.");
                 } else if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
@@ -33482,6 +33489,8 @@ impl DawUi {
                             ui.selectable_label(selected, label)
                         };
                         let clicked = response.clicked();
+                        let middle_clicked =
+                            response.clicked_by(egui::PointerButton::Middle);
                         let double_clicked = response.double_clicked();
                         let start_fraction = if clicked
                             && !entry.is_directory
@@ -33536,6 +33545,7 @@ impl DawUi {
                             && ui.small_button("#").on_hover_text("Edit tags").clicked();
                         (
                             clicked,
+                            middle_clicked,
                             double_clicked,
                             start_fraction,
                             favorite_clicked,
@@ -33545,6 +33555,7 @@ impl DawUi {
                     let row_rect = row.response.rect;
                     let (
                         clicked,
+                        middle_clicked,
                         double_clicked,
                         start_fraction,
                         favorite_clicked,
@@ -33566,6 +33577,17 @@ impl DawUi {
                         {
                             preview = Some((entry.path.clone(), start_fraction));
                         }
+                    }
+                    // The Browser manual: the middle mouse button loads
+                    // compatible content on the selected Channel, matching the
+                    // "Send to selected Channel" context-menu action.
+                    if middle_clicked
+                        && !entry.is_directory
+                        && browser_file_kind(&entry.path) == Some(BrowserFileKind::Audio)
+                        && let Some((channel_id, _)) = &sample_target
+                    {
+                        self.browser_selected = Some(entry.path.clone());
+                        load_sample = Some((*channel_id, entry.path.clone()));
                     }
                     if favorite_clicked {
                         favorite = Some(entry.path.clone());
@@ -33915,6 +33937,8 @@ impl DawUi {
                             format!("★ {name}"),
                         );
                         let clicked = response.clicked();
+                        let middle_clicked =
+                            response.clicked_by(egui::PointerButton::Middle);
                         let double_clicked = response.double_clicked();
                         let start_fraction = if clicked
                             && browser_file_kind(&path) == Some(BrowserFileKind::Audio)
@@ -33957,6 +33981,7 @@ impl DawUi {
                             });
                         (
                             clicked,
+                            middle_clicked,
                             double_clicked,
                             start_fraction,
                             ui.small_button("×").clicked(),
@@ -33965,7 +33990,8 @@ impl DawUi {
                     if step_sample_path.as_ref() == Some(&path) {
                         ui.scroll_to_rect(row.response.rect, Some(egui::Align::Center));
                     }
-                    let (clicked, double_clicked, start_fraction, remove_clicked) = row.inner;
+                    let (clicked, middle_clicked, double_clicked, start_fraction, remove_clicked) =
+                        row.inner;
                     if clicked {
                         self.browser_selected = Some(path.clone());
                     }
@@ -33973,6 +33999,16 @@ impl DawUi {
                         activate = Some(path.clone());
                     } else if clicked && browser_file_kind(&path) == Some(BrowserFileKind::Audio) {
                         preview = Some((path.clone(), start_fraction));
+                    }
+                    // The Browser manual: the middle mouse button loads
+                    // compatible content on the selected Channel, matching the
+                    // "Send to selected Channel" context-menu action.
+                    if middle_clicked
+                        && browser_file_kind(&path) == Some(BrowserFileKind::Audio)
+                        && let Some((channel_id, _)) = &sample_target
+                    {
+                        self.browser_selected = Some(path.clone());
+                        load_sample = Some((*channel_id, path.clone()));
                     }
                     if remove_clicked {
                         remove = Some(path);
@@ -60254,6 +60290,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         let linked_automation_sources = self.vst3_playlist_automation_sources(&render_document);
@@ -61050,6 +61087,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
@@ -61230,6 +61268,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         if render_range.is_some() {
@@ -61340,6 +61379,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);

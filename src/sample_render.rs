@@ -423,6 +423,75 @@ fn playlist_wav_cue_points(
     Ok(cue_points)
 }
 
+/// FL Studio's full-song render length floor, from the manual's render-length
+/// hierarchy ("Exporting Audio & MIDI", Project type): after any timeline
+/// selection, the song length is set by the last time marker beyond the last
+/// bar containing data, or by the end of that bar, before the Tail setting is
+/// applied. Returns `content_frames` unchanged when the prepared content
+/// already reaches that floor.
+fn playlist_render_length_floor_frames(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    sample_rate: u32,
+    content_frames: u64,
+) -> Result<u64, String> {
+    if content_frames == 0 {
+        return Ok(content_frames);
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
+    let Some(content_end_tick) = tempo_map.tick_at_frame(content_frames, sample_rate) else {
+        return Ok(content_frames);
+    };
+    // Prepared content ends are frame conversions of whole tick positions, so
+    // round away the conversion error: an end exactly on a barline closes that
+    // bar instead of opening the next one.
+    let content_end_tick = content_end_tick.round() as u64;
+    if content_end_tick == 0 {
+        return Ok(content_frames);
+    }
+    let ppq = document.header().ppq();
+    let signature_changes = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| marker.is_signature())
+        .filter_map(|marker| {
+            Some((
+                marker.position_ticks(),
+                marker.numerator()?.max(1),
+                marker.denominator()?.max(1),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let (bar_start, signature) = performance_signature_and_bar_start(
+        content_end_tick - 1,
+        document.metadata().time_signature(),
+        &signature_changes,
+        ppq,
+    );
+    let mut floor_tick = bar_start.saturating_add(performance_bar_ticks(ppq, signature));
+    // The last time marker beyond the last bar containing data sets the length
+    // instead; signature markers are meter records, not time markers.
+    if let Some(last_marker_tick) = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| !marker.is_signature())
+        .map(|marker| u64::from(marker.position_ticks()))
+        .max()
+    {
+        floor_tick = floor_tick.max(last_marker_tick);
+    }
+    if floor_tick <= content_end_tick {
+        return Ok(content_frames);
+    }
+    tempo_map.frame_at_tick(floor_tick, sample_rate)
+}
+
 fn push_wav_cue_point(
     cue_points: &mut Vec<WavCuePoint>,
     sample_offset: u64,
@@ -736,6 +805,11 @@ pub struct SamplerPatternRenderOptions {
     pub read_sample_root_note: bool,
     /// Use supported embedded source-tempo metadata when calculating Sampler time stretching.
     pub read_sample_tempo_information: bool,
+    /// Ignore the Max poly setting in Miscellaneous Channel Settings for this
+    /// render, as FL Studio's "Disable maximum polyphony" export option does
+    /// (fl-studio-online-manual/html/fformats_save_export.htm). The Mono
+    /// option is not ignored.
+    pub disable_maximum_polyphony: bool,
 }
 
 /// Timing and prepared plug-in stream for live Pattern-mode playback.
@@ -909,6 +983,7 @@ impl Default for SamplerPatternRenderOptions {
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             read_sample_root_note: true,
             read_sample_tempo_information: true,
+            disable_maximum_polyphony: false,
         }
     }
 }
@@ -1486,6 +1561,11 @@ pub struct PlaylistRenderOptions {
     pub read_sample_root_note: bool,
     /// Use supported embedded source-tempo metadata when calculating Sampler and Audio Clip stretching.
     pub read_sample_tempo_information: bool,
+    /// Ignore the Max poly setting in Miscellaneous Channel Settings for this
+    /// render, as FL Studio's "Disable maximum polyphony" export option does
+    /// (fl-studio-online-manual/html/fformats_save_export.htm). The Mono
+    /// option is not ignored.
+    pub disable_maximum_polyphony: bool,
     /// App-local per-instance Audio Clip controls applied in live playback and renders.
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
     /// Pre-rendered CLAP instruments scheduled on the Playlist timeline.
@@ -2744,6 +2824,7 @@ impl Default for PlaylistRenderOptions {
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
             read_sample_tempo_information: true,
+            disable_maximum_polyphony: false,
             clip_envelopes: Arc::new(Vec::new()),
             clap_audio_layers: Arc::new(Vec::new()),
             clap_audio_channel_ids: Arc::new(BTreeSet::new()),
@@ -4830,6 +4911,18 @@ fn render_playlist_with_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
+    if output_start_frame == 0 && output_end_frame.is_none() {
+        // Full-song renders follow the manual's length hierarchy: the end of
+        // the last bar containing data, or the last time marker beyond it,
+        // sets the length before the Tail setting is applied. Range renders
+        // keep the selected timeline bounds instead.
+        content_frames = playlist_render_length_floor_frames(
+            document,
+            options.arrangement_id,
+            options.sample_rate,
+            content_frames,
+        )?;
+    }
     if output_start_frame > 0 || output_end_frame.is_some() {
         wav_cue_points.retain_mut(|point| {
             let absolute_offset = u64::from(point.sample_offset);
@@ -5485,6 +5578,14 @@ pub fn render_playlist_mixer_stems_with_vst2_and_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
+    // Stem renders are full-song renders, so the manual's length hierarchy
+    // applies to them as well.
+    content_frames = playlist_render_length_floor_frames(
+        document,
+        options.arrangement_id,
+        options.sample_rate,
+        content_frames,
+    )?;
     let mut frames =
         add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
@@ -16507,7 +16608,11 @@ fn prepare_sampler_arrangement(
                     options.sample_rate,
                     ppq,
                 ),
-                max_polyphony_raw: channel.sampler_max_polyphony_raw(),
+                max_polyphony_raw: if options.disable_maximum_polyphony {
+                    None
+                } else {
+                    channel.sampler_max_polyphony_raw()
+                },
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
                 polyphony_slide_raw: channel.sampler_polyphony_slide_raw(),
@@ -21164,7 +21269,11 @@ fn prepare_sampler_pattern_for_channel_internal(
                     options.sample_rate,
                     ppq,
                 ),
-                max_polyphony_raw: channel.sampler_max_polyphony_raw(),
+                max_polyphony_raw: if options.disable_maximum_polyphony {
+                    None
+                } else {
+                    channel.sampler_max_polyphony_raw()
+                },
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
                 polyphony_slide_raw: channel.sampler_polyphony_slide_raw(),
@@ -25632,6 +25741,7 @@ impl Drop for TemporaryRenderFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TimeMarkerEdit;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -25718,6 +25828,246 @@ mod tests {
             playlist_minimum_tail_end_frame(100, 10, 5, &[make_layer(120)]).unwrap(),
             150,
         );
+    }
+
+    fn render_length_fixture() -> FlpDocument {
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            assert!(payload.len() < 128);
+            event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+            event_stream.extend_from_slice(payload);
+        }
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 0, 0, 0x15, 4]);
+        append_data_event(&mut event_stream, 0xC4, b"length.wav\0");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+
+        let mut playlist_clip = vec![0_u8; 80];
+        playlist_clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+        playlist_clip[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        playlist_clip[8..12].copy_from_slice(&384_u32.to_le_bytes());
+        playlist_clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        playlist_clip[24..28].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        playlist_clip[28..32].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &playlist_clip);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("render length fixture should parse")
+    }
+
+    #[test]
+    fn playlist_render_length_floor_uses_last_data_bar_and_time_markers() {
+        // The manual's song-length hierarchy: the end of the last bar
+        // containing data, or the last time marker beyond it, sets the render
+        // length before the Tail setting. PPQ is 96, so a 4/4 bar is 384 ticks.
+        let mut document = render_length_fixture();
+        let tempo_map = PlaylistTempoMap::for_arrangement(&document, 0).unwrap();
+        let frame_at = |tick: u64| tempo_map.frame_at_tick(tick, 48_000).unwrap();
+
+        // Content ending mid-bar extends to the end of that bar.
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(384)
+        );
+        // Content ending exactly on a barline already reaches the floor.
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(384)).unwrap(),
+            frame_at(384)
+        );
+        // A marker inside the last data bar does not shorten the bar floor.
+        document
+            .create_time_marker(
+                0,
+                TimeMarkerEdit {
+                    position_ticks: Some(200),
+                    is_signature: Some(false),
+                    numerator: None,
+                    denominator: None,
+                    name: Some("Middle".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(384)
+        );
+        // The last time marker beyond the last data bar sets the length.
+        document
+            .create_time_marker(
+                0,
+                TimeMarkerEdit {
+                    position_ticks: Some(500),
+                    is_signature: Some(false),
+                    numerator: None,
+                    denominator: None,
+                    name: Some("End".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(500)
+        );
+    }
+
+    #[test]
+    fn playlist_render_length_floor_follows_signature_markers() {
+        let mut document = render_length_fixture();
+        let tempo_map = PlaylistTempoMap::for_arrangement(&document, 0).unwrap();
+        let frame_at = |tick: u64| tempo_map.frame_at_tick(tick, 48_000).unwrap();
+
+        // A 3/4 signature marker at tick 384 makes the bar containing tick 400
+        // run from 384 to 672, and the signature marker itself does not count
+        // as a time marker for the length.
+        document
+            .create_time_marker(
+                0,
+                TimeMarkerEdit {
+                    position_ticks: Some(384),
+                    is_signature: Some(true),
+                    numerator: Some(3),
+                    denominator: Some(4),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(400)).unwrap(),
+            frame_at(672)
+        );
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(384)
+        );
+    }
+
+    #[test]
+    fn disable_maximum_polyphony_render_option_ignores_the_max_poly_setting() {
+        // The manual's Export page: "Disable maximum polyphony - Ignores the
+        // Max poly setting in Miscellaneous Channel Settings but does NOT
+        // ignore Mono option if selected"
+        // (fl-studio-online-manual/html/fformats_save_export.htm). The fixture
+        // channel carries Max Polyphony 1 (0xDD event) with Mono off, and the
+        // pattern holds two overlapping notes, so the second note steals the
+        // first voice unless the option is set.
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            assert!(payload.len() < 128);
+            event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+            event_stream.extend_from_slice(payload);
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "flp-rebuild-max-polyphony-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("temporary test folder should be created");
+        let sample_path = root.join("poly.wav");
+        let mut file = File::create(&sample_path).expect("temporary WAV should be created");
+        // Two seconds of stereo PCM16 audio, so the first voice is still
+        // sounding when the second note starts.
+        let frames = 44_100_u32 * 2;
+        write_wav_header(
+            &mut file,
+            44_100,
+            frames,
+            frames * 4,
+            WavSampleFormat::Pcm16,
+            WavChannelMode::Stereo,
+        )
+        .unwrap();
+        let mut data = Vec::with_capacity((frames * 4) as usize);
+        for _ in 0..(frames * 2) {
+            data.extend_from_slice(&8_192_i16.to_le_bytes());
+        }
+        file.write_all(&data).unwrap();
+        drop(file);
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 7, 0, 0x15, 0]);
+        // Project strings are UTF-16LE in FL Studio 11.5+ projects.
+        let mut sample_path_payload = Vec::new();
+        for unit in "poly.wav".encode_utf16().chain(std::iter::once(0)) {
+            sample_path_payload.extend_from_slice(&unit.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xC4, &sample_path_payload);
+        let mut polyphony = Vec::new();
+        polyphony.extend_from_slice(&1_u32.to_le_bytes());
+        polyphony.extend_from_slice(&0_u32.to_le_bytes());
+        polyphony.push(0);
+        append_data_event(&mut event_stream, 0xDD, &polyphony);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        // Pattern 1 with two overlapping notes on channel 7, encoded as raw
+        // 24-byte score records (the layout PatternNote::decode reads).
+        event_stream.extend_from_slice(&[0x41, 1, 0]);
+        let mut note_records = Vec::new();
+        for position in [0_u32, 96] {
+            let mut record = [0_u8; 24];
+            record[0..4].copy_from_slice(&position.to_le_bytes());
+            record[4..6].copy_from_slice(&0x4000_u16.to_le_bytes());
+            record[6..8].copy_from_slice(&7_u16.to_le_bytes());
+            record[8..12].copy_from_slice(&384_u32.to_le_bytes());
+            record[12..14].copy_from_slice(&60_u16.to_le_bytes());
+            record[16] = 120;
+            record[18] = 64;
+            record[20] = 64;
+            record[21] = 100;
+            record[22] = 128;
+            record[23] = 128;
+            note_records.extend_from_slice(&record);
+        }
+        append_data_event(&mut event_stream, 0xE0, &note_records);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        let document = FlpDocument::parse(&bytes).expect("polyphony fixture should parse");
+        assert_eq!(document.channels()[0].sampler_max_polyphony_raw(), Some(1));
+        assert_eq!(document.channels()[0].sampler_mono_enabled(), Some(false));
+        let pattern_id = 1;
+
+        let project_path = root.join("project.flp");
+        let options = SamplerPatternRenderOptions {
+            pattern_id,
+            ..SamplerPatternRenderOptions::default()
+        };
+        let (_, limited) = render_sampler_pattern_to_stereo_buffer(
+            &document,
+            &project_path,
+            options,
+        )
+        .expect("limited render should succeed");
+        assert_eq!(limited.voices_stolen, 1);
+
+        let (_, unlimited) = render_sampler_pattern_to_stereo_buffer(
+            &document,
+            &project_path,
+            SamplerPatternRenderOptions {
+                disable_maximum_polyphony: true,
+                ..options
+            },
+        )
+        .expect("unlimited render should succeed");
+        assert_eq!(unlimited.voices_stolen, 0);
+
+        fs::remove_dir_all(root).expect("temporary test folder should be removed");
     }
 
     fn performance_audio_clip_fixture(record_size: usize, scale: Option<f64>) -> FlpDocument {
@@ -28288,6 +28638,7 @@ mod tests {
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
                     read_sample_tempo_information: true,
+                    disable_maximum_polyphony: false,
                     clip_envelopes: Arc::new(Vec::new()),
                     clap_audio_layers: Arc::new(Vec::new()),
                     clap_audio_channel_ids: Arc::new(BTreeSet::new()),
