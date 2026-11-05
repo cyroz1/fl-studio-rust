@@ -5021,6 +5021,18 @@ impl BrowserTab {
             Self::Recent => "Recent",
         }
     }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Files => "Browser: files on disk",
+            Self::CurrentProject => {
+                "Browser: the current project's channels, Patterns, and plug-in states"
+            }
+            Self::Plugins => "Browser: installed plug-ins",
+            Self::Favorites => "Browser: favorite files and folders",
+            Self::Recent => "Browser: recent projects",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6061,6 +6073,7 @@ struct DawUi {
     hide_collapsed_playlist_groups: bool,
     touch_controls: bool,
     touch_controls_style_applied: bool,
+    hover_hint: Option<String>,
     playlist_zero_crossing_splits: bool,
     playlist_edit_patterns_in: PlaylistEditPatternsIn,
     playlist_clip_focus: PlaylistClipFocus,
@@ -9702,6 +9715,7 @@ impl DawUi {
             hide_collapsed_playlist_groups,
             touch_controls,
             touch_controls_style_applied: false,
+            hover_hint: None,
             playlist_edit_patterns_in,
             playlist_clip_focus: PlaylistClipFocus::default(),
             playlist_pattern_color_mode,
@@ -10097,6 +10111,15 @@ impl DawUi {
             app.recovery_prompt = Some(prompt);
         }
         app
+    }
+
+    /// Record the hint for the control currently under the pointer. The
+    /// status bar acts as the hint bar: it shows this text for the frame and
+    /// falls back to the status message when nothing is hovered.
+    fn note_hover_hint(&mut self, response: &egui::Response, hint: &str) {
+        if response.hovered() {
+            self.hover_hint = Some(hint.to_owned());
+        }
     }
 
     /// The saved placement for a detached window, with its position checked
@@ -21152,7 +21175,39 @@ impl DawUi {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Untitled".to_owned())
                 };
-                ui.label(format!("{}{}", title, if self.dirty { " *" } else { "" }));
+                // Project picker: click the project name to open another
+                // project or switch to a recent one without the File menu.
+                let picker_label = format!("{}{}", title, if self.dirty { " *" } else { "" });
+                ui.menu_button(picker_label, |ui| {
+                    if ui.button("Open…").clicked() {
+                        self.open_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
+                    let recent_projects = self.browser_recent_projects.clone();
+                    if recent_projects.is_empty() {
+                        ui.label("No recent projects");
+                    }
+                    let mut open_path = None;
+                    for path in recent_projects.iter().take(10) {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        let is_current = self.current_path.as_deref() == Some(path.as_path());
+                        if ui
+                            .add_enabled(!is_current, egui::Button::new(name))
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            open_path = Some(path.clone());
+                        }
+                    }
+                    if let Some(path) = open_path {
+                        ui.close();
+                        self.open_project(&path);
+                    }
+                });
             });
         });
     }
@@ -24668,38 +24723,38 @@ impl DawUi {
             )
             .fill(if recording { RED } else { PANEL })
             .stroke(Stroke::NONE);
-            let record_response =
-                ui.add(record_button)
-                    .on_hover_text(if recording_precount {
-                        "Cancel recording count-in"
-                    } else if recording_audio && recording_midi {
-                        "Finish audio and MIDI note recording"
-                    } else if recording_audio {
-                        "Finish audio recording"
-                    } else if recording_midi
-                        && self
-                            .midi_recording
-                            .as_ref()
-                            .is_some_and(|recording| recording.automation.is_some())
-                    {
-                        if self
-                            .midi_recording
-                            .as_ref()
-                            .is_some_and(|recording| recording.record_notes)
-                        {
-                            "Finish MIDI notes and MIDI automation recording"
-                        } else {
-                            "Finish MIDI automation recording"
-                        }
-                    } else if recording_midi {
-                        "Finish MIDI note recording"
-                    } else if audio_recording_finalizing {
-                        "Finalizing the recorded audio take"
-                    } else if can_record {
-                        "Record the selected audio and MIDI input types"
-                    } else {
-                        "Enable a recording filter and connect its input first"
-                    });
+            let record_hint: &str = if recording_precount {
+                "Cancel recording count-in"
+            } else if recording_audio && recording_midi {
+                "Finish audio and MIDI note recording"
+            } else if recording_audio {
+                "Finish audio recording"
+            } else if recording_midi
+                && self
+                    .midi_recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.automation.is_some())
+            {
+                if self
+                    .midi_recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.record_notes)
+                {
+                    "Finish MIDI notes and MIDI automation recording"
+                } else {
+                    "Finish MIDI automation recording"
+                }
+            } else if recording_midi {
+                "Finish MIDI note recording"
+            } else if audio_recording_finalizing {
+                "Finalizing the recorded audio take"
+            } else if can_record {
+                "Record the selected audio and MIDI input types"
+            } else {
+                "Enable a recording filter and connect its input first"
+            };
+            let record_response = ui.add(record_button).on_hover_text(record_hint);
+            self.note_hover_hint(&record_response, record_hint);
             let mut record_filters_changed = false;
             let _ = record_response.context_menu(|ui| {
                 apply_local_ui_scale(ui, self.popup_menu_scale);
@@ -24860,7 +24915,9 @@ impl DawUi {
                     }
                 }
             }
-            if ui.button("■").on_hover_text("Stop").clicked() {
+            let stop_response = ui.button("■").on_hover_text("Stop");
+            self.note_hover_hint(&stop_response, "Stop");
+            if stop_response.clicked() {
                 let was_preparing = self.pending_audio_render.is_some()
                     || self.playlist_render_is_pending()
                     || self.pending_clap_pattern_playback.is_some()
@@ -24878,20 +24935,21 @@ impl DawUi {
                     "Project playback stopped".to_owned()
                 };
             }
-            if ui
+            let pattern_mode_hint = "Pattern mode (L): play the selected Pattern";
+            let pattern_mode_response = ui
                 .selectable_label(self.pattern_playback_mode, "PAT")
                 .on_hover_text(
                     "L: play the selected Pattern through enabled Sampler and loaded VST3 channels, plus any CLAP Pattern transport assignments. CLAP loops use project base tempo and mix directly to Master; Playlist Audio Clips and their tempo automation are not included.",
-                )
-                .clicked()
-            {
+                );
+            self.note_hover_hint(&pattern_mode_response, pattern_mode_hint);
+            if pattern_mode_response.clicked() {
                 self.set_pattern_playback_mode(true);
             }
-            if ui
+            let song_mode_response = ui
                 .selectable_label(!self.pattern_playback_mode, "SONG")
-                .on_hover_text("L: play the Playlist arrangement")
-                .clicked()
-            {
+                .on_hover_text("L: play the Playlist arrangement");
+            self.note_hover_hint(&song_mode_response, "Song mode (L): play the Playlist arrangement");
+            if song_mode_response.clicked() {
                 self.set_pattern_playback_mode(false);
             }
             let metronome_response = ui
@@ -24899,6 +24957,10 @@ impl DawUi {
                 .on_hover_text(
                     "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click for samples and Mixer route, also used by PRE)",
                 );
+            self.note_hover_hint(
+                &metronome_response,
+                "Metronome (Ctrl/Cmd+M; right-click for samples and Mixer route)",
+            );
             let metronome_mixer_tracks = self.document.as_ref().map_or_else(
                 || vec![(0_i8, "Master".to_owned())],
                 |document| {
@@ -24996,6 +25058,10 @@ impl DawUi {
                 .on_hover_text(
                     "Recording count-in: play clicks through the MET Mixer route before a stopped recording (Ctrl/Cmd+P; right-click for bar count)",
                 );
+            self.note_hover_hint(
+                &precount_response,
+                "Recording count-in (Ctrl/Cmd+P; right-click for bar count)",
+            );
             let _ = precount_response.context_menu(|ui| {
                 apply_local_ui_scale(ui, self.popup_menu_scale);
                 let mut enabled = self.recording_precount_enabled;
@@ -25041,24 +25107,24 @@ impl DawUi {
                 "Play"
             };
             let play_fill = if self.playing { GREEN } else { BLUE };
-            if ui
+            let play_response = ui
                 .add(
                     egui::Button::new(egui::RichText::new(play_label).color(Color32::WHITE))
                         .fill(play_fill)
                         .stroke(Stroke::NONE),
                 )
-                .on_hover_text(play_hint)
-                .clicked()
-            {
+                .on_hover_text(play_hint);
+            self.note_hover_hint(&play_response, play_hint);
+            if play_response.clicked() {
                 self.toggle_project_playback();
             }
             ui.separator();
             ui.label("Tempo");
             let mut bpm = self.tempo_bpm;
-            if ui
-                .add(egui::DragValue::new(&mut bpm).speed(0.1).suffix(" BPM"))
-                .changed()
-            {
+            let tempo_response =
+                ui.add(egui::DragValue::new(&mut bpm).speed(0.1).suffix(" BPM"));
+            self.note_hover_hint(&tempo_response, "Song tempo");
+            if tempo_response.changed() {
                 self.tempo_bpm = bpm;
                 self.update_tempo(bpm);
             }
@@ -25078,7 +25144,7 @@ impl DawUi {
                             .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned)
                     })
                     .unwrap_or_else(|| "No patterns".to_owned());
-                egui::ComboBox::from_id_salt("transport-pattern-picker")
+                let pattern_picker_response = egui::ComboBox::from_id_salt("transport-pattern-picker")
                     .selected_text(selected_pattern_text)
                     .width(132.0 * scale)
                     .show_ui(ui, |ui| {
@@ -25101,6 +25167,10 @@ impl DawUi {
                             });
                         }
                     });
+                self.note_hover_hint(
+                    &pattern_picker_response.response,
+                    "Pattern picker: choose the Pattern to edit and audition in PAT mode",
+                );
                 if ui
                     .small_button("+")
                     .on_hover_text("Create a new pattern")
@@ -30960,7 +31030,9 @@ impl DawUi {
             for tab in BrowserTab::ALL {
                 let selected =
                     self.browser_tab == tab && self.browser_active_saved_search.is_none();
-                if ui.selectable_label(selected, tab.label()).clicked() {
+                let tab_response = ui.selectable_label(selected, tab.label());
+                self.note_hover_hint(&tab_response, tab.hint());
+                if tab_response.clicked() {
                     self.browser_tab = tab;
                     self.browser_active_saved_search = None;
                 }
@@ -84525,6 +84597,7 @@ impl eframe::App for DawUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.hover_hint = None;
         self.publish_live_pattern_note_updates();
         self.publish_midi_script_transport_state();
         let vst2_channel_editor_failures = self
@@ -85483,7 +85556,9 @@ impl eframe::App for DawUi {
                             ui.horizontal_centered(|ui| {
                                 ui.label(if self.dirty { "●" } else { "" })
                                     .on_hover_text("Unsaved project changes");
-                                ui.label(&self.status);
+                                // Hint bar: the hovered control's hint wins
+                                // over the standing status message.
+                                ui.label(self.hover_hint.as_deref().unwrap_or(&self.status));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
