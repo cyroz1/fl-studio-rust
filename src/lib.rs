@@ -13206,11 +13206,13 @@ impl FlpDocument {
         Ok(template_index.saturating_add(1))
     }
 
-    /// Creates an Audio Clip by copying a recognized project Playlist clip record.
+    /// Creates an Audio Clip from a recognized project Playlist clip record.
     ///
     /// The requested channel must be an Audio Clip channel. Position, channel target, length,
     /// track, and (when present) clip ID are assigned; all other record bytes remain copied from
     /// the template. An Audio Clip record in another arrangement can seed an empty arrangement.
+    /// When the project has no Audio Clip record at all, a minimal full-source record is
+    /// synthesized in the layout established by the project's clips or version instead.
     pub fn create_playlist_audio_clip(
         &mut self,
         arrangement_id: u16,
@@ -13292,47 +13294,64 @@ impl FlpDocument {
                         matches!(clip.target(), PlaylistClipTarget::Channel { id } if channel_ids.contains(&id))
                     })
             });
-        let Some(template) = template else {
-            return Err(FlpError::UnsupportedEdit(
-                "the project has no recognized Audio Clip record to use as a template",
-            ));
-        };
-        if channel_id >= template.pattern_base {
-            return Err(FlpError::UnsupportedEdit(
-                "the Audio Clip channel ID does not fit the template's channel target range",
-            ));
-        }
+        let record = if let Some(template) = template {
+            if channel_id >= template.pattern_base {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Audio Clip channel ID does not fit the template's channel target range",
+                ));
+            }
 
-        let record_size = template.record_size;
-        let record_start = template
-            .source_record_index
-            .checked_mul(record_size)
-            .ok_or(FlpError::LengthOverflow)?;
-        let record_end = record_start
-            .checked_add(record_size)
-            .ok_or(FlpError::LengthOverflow)?;
-        let record =
+            let record_size = template.record_size;
+            let record_start = template
+                .source_record_index
+                .checked_mul(record_size)
+                .ok_or(FlpError::LengthOverflow)?;
+            let record_end = record_start
+                .checked_add(record_size)
+                .ok_or(FlpError::LengthOverflow)?;
+            let event =
+                self.events
+                    .get(template.source_event_index)
+                    .ok_or(FlpError::UnsupportedEdit(
+                        "the Playlist clip template event no longer exists",
+                    ))?;
+            if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Playlist clip template is not in a length-prefixed data event",
+                ));
+            }
+            if record_end > event.payload.len() || !event.payload.len().is_multiple_of(record_size)
             {
-                let event = self.events.get(template.source_event_index).ok_or(
-                    FlpError::UnsupportedEdit("the Playlist clip template event no longer exists"),
-                )?;
-                if event.opcode != 0xE9 || !matches!(event.encoding, PayloadEncoding::Data { .. }) {
-                    return Err(FlpError::UnsupportedEdit(
-                        "the Playlist clip template is not in a length-prefixed data event",
-                    ));
-                }
-                if record_end > event.payload.len()
-                    || !event.payload.len().is_multiple_of(record_size)
-                {
-                    return Err(FlpError::UnsupportedEdit(
-                        "the Playlist clip template does not fit its event payload",
-                    ));
-                }
-                let mut record = event.payload[record_start..record_end].to_vec();
-                record[6..8].copy_from_slice(&channel_id.to_le_bytes());
-                initialize_new_playlist_clip_length(&mut record, length_ticks);
-                record
-            };
+                return Err(FlpError::UnsupportedEdit(
+                    "the Playlist clip template does not fit its event payload",
+                ));
+            }
+            let mut record = event.payload[record_start..record_end].to_vec();
+            record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+            initialize_new_playlist_clip_length(&mut record, length_ticks);
+            record
+        } else {
+            // A project can contain a sample-backed Audio Clip channel before
+            // any Playlist clip has ever been placed. In that case there is no
+            // record whose opaque tail can be copied, so synthesize the
+            // smallest record layout established by the project version (or
+            // by another clip in the project) and let the normal paste path
+            // assign its position, track, and clip ID.
+            let (record_size, pattern_base) = synthesized_playlist_audio_clip_layout(
+                self.project_version.as_deref(),
+                arrangement,
+                &arrangements,
+            );
+            if channel_id >= pattern_base {
+                return Err(FlpError::UnsupportedEdit(
+                    "the Audio Clip channel ID does not fit the synthesized record's channel target range",
+                ));
+            }
+            let mut record =
+                synthesized_playlist_audio_clip_record(record_size, pattern_base, channel_id);
+            initialize_new_playlist_clip_length(&mut record, length_ticks);
+            record
+        };
 
         let clipboard = PlaylistClipClipboard { raw_record: record };
         self.paste_playlist_clip(
@@ -29638,6 +29657,49 @@ fn playlist_record_has_clip_id(record_size: usize) -> bool {
 
 /// Initializes the duration fields for a newly created clip copied from a
 /// template. Existing record tails must remain untouched.
+fn synthesized_playlist_audio_clip_layout(
+    project_version: Option<&str>,
+    arrangement: &Arrangement,
+    arrangements: &[Arrangement],
+) -> (usize, u16) {
+    if let Some(clip) = arrangement.clips.last().or_else(|| {
+        arrangements
+            .iter()
+            .flat_map(|candidate| candidate.clips.iter())
+            .last()
+    }) {
+        return (clip.record_size, clip.pattern_base);
+    }
+    (
+        playlist_clip_record_size(project_version, &[], 0).unwrap_or(80),
+        0x5000,
+    )
+}
+
+fn synthesized_playlist_audio_clip_record(
+    record_size: usize,
+    pattern_base: u16,
+    channel_id: u16,
+) -> Vec<u8> {
+    let mut record = vec![0; record_size];
+    record[4..6].copy_from_slice(&pattern_base.to_le_bytes());
+    record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+    // These are the common header bytes carried by every recognized
+    // full-source clip fixture: an unmuted item whose source window is the
+    // complete channel sample rather than a cut.
+    record[20..24].copy_from_slice(&[0x40, 0x64, 0x80, 0x80]);
+    if record_size >= 32 {
+        record[24..28].copy_from_slice(&0.0f32.to_le_bytes());
+        record[28..32].copy_from_slice(&1.0f32.to_le_bytes());
+    }
+    match record_size {
+        60 => record[52..56].copy_from_slice(&1.0f32.to_le_bytes()),
+        80 => record[64..72].copy_from_slice(&1.0f64.to_le_bytes()),
+        _ => {}
+    }
+    record
+}
+
 fn initialize_new_playlist_clip_length(record: &mut [u8], length_ticks: u32) {
     record[8..12].copy_from_slice(&length_ticks.to_le_bytes());
     if record.len() == 88 {
@@ -34853,19 +34915,72 @@ mod tests {
     }
 
     #[test]
-    fn rejects_playlist_audio_clip_creation_without_an_audio_template_atomically() {
+    fn creates_playlist_audio_clip_without_an_audio_template_by_synthesizing_a_record() {
         let mut document = audio_clip_fixture();
         document
             .delete_playlist_clip(3, 1)
             .expect("the only Audio Clip template should be removable");
-        let input = document.encode_lossless().unwrap();
 
-        assert!(
-            document
-                .create_playlist_audio_clip(3, 9, 0, 960, 0)
-                .is_err()
+        let index = document
+            .create_playlist_audio_clip(3, 9, 480, 960, 2)
+            .expect("a remaining clip layout should seed a synthesized Audio Clip record");
+        assert_eq!(index, 1);
+
+        let arrangements = document.arrangements().unwrap();
+        let clip = &arrangements[0].clips[index];
+        assert_eq!(clip.target(), PlaylistClipTarget::Channel { id: 9 });
+        assert_eq!(clip.position_ticks, 480);
+        assert_eq!(clip.length_ticks, 960);
+        assert_eq!(clip.track_index, Some(2));
+        assert_eq!(clip.record_size, 80);
+        assert_eq!(clip.pattern_base, 0x5000);
+        assert_eq!(clip.clip_id, Some(2));
+        assert_eq!(clip.scale, Some(1.0));
+        assert_eq!((clip.start_offset, clip.end_offset), (0.0, 1.0));
+        assert!(!clip.is_muted());
+
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("the synthesized Audio Clip should round-trip");
+        let reparsed_arrangements = reparsed.arrangements().unwrap();
+        let reparsed_clip = &reparsed_arrangements[0].clips[index];
+        assert_eq!(
+            reparsed_clip.target(),
+            PlaylistClipTarget::Channel { id: 9 }
         );
-        assert_eq!(document.encode_lossless().unwrap(), input);
+        assert_eq!(reparsed_clip.record_size, 80);
+        assert_eq!(reparsed_clip.clip_id, Some(2));
+        assert_eq!(reparsed_clip.scale, Some(1.0));
+    }
+
+    #[test]
+    fn creates_playlist_audio_clip_in_a_project_with_no_clips_at_all() {
+        let mut event_stream = vec![0x40, 9, 0, 0x15, 4];
+        append_data_event(
+            &mut event_stream,
+            0xC4,
+            &utf16_project_string("/samples/recording.wav"),
+        );
+        event_stream.extend_from_slice(&[0x48, 9, 0, 0x62, 0, 0, 0x63, 3, 0]);
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("the project fixture should parse");
+
+        let index = document
+            .create_playlist_audio_clip(3, 9, 0, 960, 0)
+            .expect("an Audio Clip channel alone should be enough to synthesize a record");
+        assert_eq!(index, 0);
+
+        let arrangements = document.arrangements().unwrap();
+        let clip = &arrangements[0].clips[index];
+        assert_eq!(clip.target(), PlaylistClipTarget::Channel { id: 9 });
+        assert_eq!(clip.record_size, 80);
+        assert_eq!(clip.pattern_base, 0x5000);
+        assert_eq!(clip.clip_id, Some(0));
+        assert_eq!(clip.scale, Some(1.0));
+        assert_eq!((clip.start_offset, clip.end_offset), (0.0, 1.0));
+
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("the first synthesized Audio Clip should round-trip");
+        assert_eq!(reparsed.arrangements().unwrap()[0].clips.len(), 1);
     }
 
     #[test]

@@ -13149,16 +13149,10 @@ impl DawUi {
         track_index: u16,
         ctx: &egui::Context,
     ) {
-        let Some(document) = self.document.as_ref() else {
+        if self.document.is_none() {
             self.status = "Open a project before adding audio to the Playlist".to_owned();
             return;
-        };
-        if !project_has_audio_clip_template(document) {
-            self.status =
-                "Add an Audio Clip to the project first so its FLP record can be reused".to_owned();
-            return;
         }
-
         self.pending_playlist_audio_drops
             .push_back(PendingPlaylistAudioDrop {
                 path: path.clone(),
@@ -13234,13 +13228,6 @@ impl DawUi {
             );
             return;
         };
-        if !project_has_audio_clip_template(document) {
-            self.status = format!(
-                "Could not add {}: the project has no Audio Clip record to reuse",
-                pending.path.display()
-            );
-            return;
-        }
         if !document
             .arrangements()
             .is_ok_and(|arrangements| arrangements.iter().any(|a| a.id == pending.arrangement_id))
