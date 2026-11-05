@@ -1553,8 +1553,10 @@ fn decoded_audio_to_stereo_samples_from(
     maximum_seconds: Option<f64>,
     start_frame: usize,
 ) -> Result<Vec<f32>, String> {
-    if audio.channels.is_empty() || audio.channels.len() > 2 || audio.sample_rate == 0 {
-        return Err("only mono and stereo samples with a valid rate can be previewed".into());
+    if audio.channels.is_empty() || audio.sample_rate == 0 {
+        return Err(
+            "only samples with at least one channel and a valid rate can be previewed".into(),
+        );
     }
     let source_frames = audio.frame_count();
     if source_frames == 0
@@ -1602,12 +1604,21 @@ fn decoded_audio_to_stereo_samples_from(
             let right = finite_sample(channel[second]);
             (left + (right - left) * fraction).clamp(-1.0, 1.0)
         };
-        let left = interpolate(&audio.channels[0]);
-        let right = if audio.channels.len() == 1 {
-            left
-        } else {
-            interpolate(&audio.channels[1])
+        // Fold any channel layout down to a stereo preview: even-indexed
+        // channels average into the left side and odd-indexed channels into
+        // the right, so mono and stereo sources pass through unchanged while
+        // multichannel sources (surround, quad, and similar) stay audible.
+        let fold_down = |first_index: usize| {
+            let mut sum = 0.0_f32;
+            let mut count = 0usize;
+            for channel in audio.channels.iter().skip(first_index).step_by(2) {
+                sum += interpolate(channel);
+                count += 1;
+            }
+            (count > 0).then(|| (sum / count as f32).clamp(-1.0, 1.0))
         };
+        let left = fold_down(0).expect("the preview checked for at least one channel");
+        let right = fold_down(1).unwrap_or(left);
         output.extend_from_slice(&[left, right]);
     }
     Ok(output)
@@ -2728,6 +2739,56 @@ mod tests {
         let estimated_frequency =
             positive_crossings as f32 * sample_rate as f32 / (middle.len() as f32 / 2.0);
         assert!((850.0..=910.0).contains(&estimated_frequency));
+    }
+
+    #[test]
+    fn browser_preview_folds_multichannel_sources_down_to_stereo() {
+        let constant = |value: f32| vec![value; 8];
+        let quad = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![constant(0.4), constant(-0.4), constant(0.8), constant(0.0)],
+        };
+        let preview = decoded_audio_to_stereo_samples(&quad, 8_000, None)
+            .expect("a four-channel source should preview");
+        assert_eq!(preview.len(), 16);
+        for frame in preview.chunks_exact(2) {
+            assert!((frame[0] - 0.6).abs() < 1e-6, "left folds channels 0 and 2");
+            assert!((frame[1] + 0.2).abs() < 1e-6, "right folds channels 1 and 3");
+        }
+
+        let surround = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![
+                constant(0.3),
+                constant(-0.3),
+                constant(0.9),
+                constant(0.0),
+                constant(0.0),
+                constant(0.0),
+            ],
+        };
+        let preview = decoded_audio_to_stereo_samples(&surround, 8_000, None)
+            .expect("a six-channel source should preview");
+        for frame in preview.chunks_exact(2) {
+            assert!((frame[0] - 0.4).abs() < 1e-6);
+            assert!((frame[1] + 0.1).abs() < 1e-6);
+        }
+
+        let mono = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![constant(0.5)],
+        };
+        let preview = decoded_audio_to_stereo_samples(&mono, 8_000, None)
+            .expect("a mono source should preview");
+        assert!(preview.chunks_exact(2).all(|frame| frame == [0.5, 0.5]));
+
+        let stereo = DecodedAudio {
+            sample_rate: 8_000,
+            channels: vec![constant(0.25), constant(-0.25)],
+        };
+        let preview = decoded_audio_to_stereo_samples(&stereo, 8_000, None)
+            .expect("a stereo source should preview");
+        assert!(preview.chunks_exact(2).all(|frame| frame == [0.25, -0.25]));
     }
 
     #[test]
