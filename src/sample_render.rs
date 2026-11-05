@@ -423,6 +423,75 @@ fn playlist_wav_cue_points(
     Ok(cue_points)
 }
 
+/// FL Studio's full-song render length floor, from the manual's render-length
+/// hierarchy ("Exporting Audio & MIDI", Project type): after any timeline
+/// selection, the song length is set by the last time marker beyond the last
+/// bar containing data, or by the end of that bar, before the Tail setting is
+/// applied. Returns `content_frames` unchanged when the prepared content
+/// already reaches that floor.
+fn playlist_render_length_floor_frames(
+    document: &FlpDocument,
+    arrangement_id: u16,
+    sample_rate: u32,
+    content_frames: u64,
+) -> Result<u64, String> {
+    if content_frames == 0 {
+        return Ok(content_frames);
+    }
+    let arrangement = document
+        .arrangements()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|arrangement| arrangement.id == arrangement_id)
+        .ok_or_else(|| format!("arrangement {arrangement_id} was not found"))?;
+    let tempo_map = PlaylistTempoMap::for_arrangement(document, arrangement_id)?;
+    let Some(content_end_tick) = tempo_map.tick_at_frame(content_frames, sample_rate) else {
+        return Ok(content_frames);
+    };
+    // Prepared content ends are frame conversions of whole tick positions, so
+    // round away the conversion error: an end exactly on a barline closes that
+    // bar instead of opening the next one.
+    let content_end_tick = content_end_tick.round() as u64;
+    if content_end_tick == 0 {
+        return Ok(content_frames);
+    }
+    let ppq = document.header().ppq();
+    let signature_changes = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| marker.is_signature())
+        .filter_map(|marker| {
+            Some((
+                marker.position_ticks(),
+                marker.numerator()?.max(1),
+                marker.denominator()?.max(1),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let (bar_start, signature) = performance_signature_and_bar_start(
+        content_end_tick - 1,
+        document.metadata().time_signature(),
+        &signature_changes,
+        ppq,
+    );
+    let mut floor_tick = bar_start.saturating_add(performance_bar_ticks(ppq, signature));
+    // The last time marker beyond the last bar containing data sets the length
+    // instead; signature markers are meter records, not time markers.
+    if let Some(last_marker_tick) = arrangement
+        .time_markers
+        .iter()
+        .filter(|marker| !marker.is_signature())
+        .map(|marker| u64::from(marker.position_ticks()))
+        .max()
+    {
+        floor_tick = floor_tick.max(last_marker_tick);
+    }
+    if floor_tick <= content_end_tick {
+        return Ok(content_frames);
+    }
+    tempo_map.frame_at_tick(floor_tick, sample_rate)
+}
+
 fn push_wav_cue_point(
     cue_points: &mut Vec<WavCuePoint>,
     sample_offset: u64,
@@ -4830,6 +4899,18 @@ fn render_playlist_with_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
+    if output_start_frame == 0 && output_end_frame.is_none() {
+        // Full-song renders follow the manual's length hierarchy: the end of
+        // the last bar containing data, or the last time marker beyond it,
+        // sets the length before the Tail setting is applied. Range renders
+        // keep the selected timeline bounds instead.
+        content_frames = playlist_render_length_floor_frames(
+            document,
+            options.arrangement_id,
+            options.sample_rate,
+            content_frames,
+        )?;
+    }
     if output_start_frame > 0 || output_end_frame.is_some() {
         wav_cue_points.retain_mut(|point| {
             let absolute_offset = u64::from(point.sample_offset);
@@ -5485,6 +5566,14 @@ pub fn render_playlist_mixer_stems_with_vst2_and_vst3_cancellable(
     {
         content_frames = content_frames.max(last_cue_frame);
     }
+    // Stem renders are full-song renders, so the manual's length hierarchy
+    // applies to them as well.
+    content_frames = playlist_render_length_floor_frames(
+        document,
+        options.arrangement_id,
+        options.sample_rate,
+        content_frames,
+    )?;
     let mut frames =
         add_render_tail_frames(content_frames, options.sample_rate, options.tail_seconds)?;
     if let Some(processor) = vst3_processor.as_mut() {
@@ -25555,6 +25644,7 @@ impl Drop for TemporaryRenderFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TimeMarkerEdit;
     use std::sync::atomic::{AtomicBool, AtomicU64};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -25640,6 +25730,127 @@ mod tests {
         assert_eq!(
             playlist_minimum_tail_end_frame(100, 10, 5, &[make_layer(120)]).unwrap(),
             150,
+        );
+    }
+
+    fn render_length_fixture() -> FlpDocument {
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            assert!(payload.len() < 128);
+            event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+            event_stream.extend_from_slice(payload);
+        }
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 0, 0, 0x15, 4]);
+        append_data_event(&mut event_stream, 0xC4, b"length.wav\0");
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        event_stream.extend_from_slice(&[0x63, 0, 0]);
+
+        let mut playlist_clip = vec![0_u8; 80];
+        playlist_clip[4..6].copy_from_slice(&0x5000_u16.to_le_bytes());
+        playlist_clip[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        playlist_clip[8..12].copy_from_slice(&384_u32.to_le_bytes());
+        playlist_clip[12..14].copy_from_slice(&499_u16.to_le_bytes());
+        playlist_clip[24..28].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        playlist_clip[28..32].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        append_data_event(&mut event_stream, 0xE9, &playlist_clip);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        FlpDocument::parse(&bytes).expect("render length fixture should parse")
+    }
+
+    #[test]
+    fn playlist_render_length_floor_uses_last_data_bar_and_time_markers() {
+        // The manual's song-length hierarchy: the end of the last bar
+        // containing data, or the last time marker beyond it, sets the render
+        // length before the Tail setting. PPQ is 96, so a 4/4 bar is 384 ticks.
+        let mut document = render_length_fixture();
+        let tempo_map = PlaylistTempoMap::for_arrangement(&document, 0).unwrap();
+        let frame_at = |tick: u64| tempo_map.frame_at_tick(tick, 48_000).unwrap();
+
+        // Content ending mid-bar extends to the end of that bar.
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(384)
+        );
+        // Content ending exactly on a barline already reaches the floor.
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(384)).unwrap(),
+            frame_at(384)
+        );
+        // A marker inside the last data bar does not shorten the bar floor.
+        document
+            .create_time_marker(
+                0,
+                TimeMarkerEdit {
+                    position_ticks: Some(200),
+                    is_signature: Some(false),
+                    numerator: None,
+                    denominator: None,
+                    name: Some("Middle".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(384)
+        );
+        // The last time marker beyond the last data bar sets the length.
+        document
+            .create_time_marker(
+                0,
+                TimeMarkerEdit {
+                    position_ticks: Some(500),
+                    is_signature: Some(false),
+                    numerator: None,
+                    denominator: None,
+                    name: Some("End".to_owned()),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(500)
+        );
+    }
+
+    #[test]
+    fn playlist_render_length_floor_follows_signature_markers() {
+        let mut document = render_length_fixture();
+        let tempo_map = PlaylistTempoMap::for_arrangement(&document, 0).unwrap();
+        let frame_at = |tick: u64| tempo_map.frame_at_tick(tick, 48_000).unwrap();
+
+        // A 3/4 signature marker at tick 384 makes the bar containing tick 400
+        // run from 384 to 672, and the signature marker itself does not count
+        // as a time marker for the length.
+        document
+            .create_time_marker(
+                0,
+                TimeMarkerEdit {
+                    position_ticks: Some(384),
+                    is_signature: Some(true),
+                    numerator: Some(3),
+                    denominator: Some(4),
+                    name: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(400)).unwrap(),
+            frame_at(672)
+        );
+        assert_eq!(
+            playlist_render_length_floor_frames(&document, 0, 48_000, frame_at(100)).unwrap(),
+            frame_at(384)
         );
     }
 
