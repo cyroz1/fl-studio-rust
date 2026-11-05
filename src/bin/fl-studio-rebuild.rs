@@ -33561,6 +33561,7 @@ impl DawUi {
         let mut playlist_clip_vertical_move = None;
         let mut playlist_clip_horizontal_move = None;
         let mut selected_track_bulk_action = None;
+        let mut all_track_bulk_action = None;
         let mut selected_track_bulk_group_action = None;
         let selected_track_count = self.selected_playlist_tracks.len();
         let has_track_selection = selected_track_count > 0;
@@ -33970,17 +33971,20 @@ impl DawUi {
                         .clicked()
                     {
                         selected_track_bulk_action = Some(true);
-                        playlist_track_edits_requested.extend(selected_track_ids.iter().map(
-                            |track_id| {
-                                (
-                                    *track_id,
-                                    PlaylistTrackEdit {
-                                        enabled: Some(true),
-                                        ..PlaylistTrackEdit::default()
-                                    },
-                                )
-                            },
-                        ));
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(!tracks.is_empty(), egui::Button::new("Mute all tracks"))
+                        .clicked()
+                    {
+                        all_track_bulk_action = Some(false);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(!tracks.is_empty(), egui::Button::new("Unmute all tracks"))
+                        .clicked()
+                    {
+                        all_track_bulk_action = Some(true);
                         ui.close();
                     }
                     if ui
@@ -38895,7 +38899,6 @@ impl DawUi {
             ui.ctx().request_repaint();
         }
 
-        let mut playlist_track_edit_failures = 0usize;
         for (track_id, edit) in playlist_track_edits_requested {
             let result = self.document.as_mut().map(|document| {
                 document.edit_playlist_track_in_arrangement(arrangement.id, track_id, edit)
@@ -38940,23 +38943,68 @@ impl DawUi {
                     };
                 }
                 Some(Err(error)) => {
-                    playlist_track_edit_failures += 1;
                     self.status = format!("Could not edit Playlist track {track_id}: {error}");
                 }
                 None => {
-                    playlist_track_edit_failures += 1;
                     self.status = "Open a project to edit Playlist tracks".to_owned();
                 }
             }
         }
-        if let Some(enabled) = selected_track_bulk_action
-            && playlist_track_edit_failures == 0
-        {
-            self.status = format!(
-                "{} {} selected Playlist tracks",
-                if enabled { "Unmuted" } else { "Muted" },
-                selected_track_ids.len()
-            );
+        let bulk_mute_actions = [
+            (
+                selected_track_bulk_action,
+                selected_track_ids.clone(),
+                false,
+            ),
+            (
+                all_track_bulk_action,
+                tracks.iter().map(|track| track.id).collect::<Vec<_>>(),
+                true,
+            ),
+        ];
+        for (bulk_action, bulk_track_ids, all_tracks) in bulk_mute_actions {
+            let Some(enabled) = bulk_action else {
+                continue;
+            };
+            let result = self.document.as_mut().map(|document| {
+                document.edit_playlist_tracks_in_arrangement(
+                    arrangement.id,
+                    &bulk_track_ids,
+                    PlaylistTrackEdit {
+                        enabled: Some(enabled),
+                        ..PlaylistTrackEdit::default()
+                    },
+                )
+            });
+            match result {
+                Some(Ok(applied)) => {
+                    self.stop_project_playback();
+                    self.dirty = true;
+                    self.project_edit_revision = self.project_edit_revision.wrapping_add(1);
+                    ui.ctx().request_repaint();
+                    self.status = if all_tracks {
+                        format!(
+                            "{} all {applied} Playlist tracks",
+                            if enabled { "Unmuted" } else { "Muted" }
+                        )
+                    } else {
+                        format!(
+                            "{} {applied} selected Playlist tracks",
+                            if enabled { "Unmuted" } else { "Muted" }
+                        )
+                    };
+                }
+                Some(Err(error)) => {
+                    self.status = format!(
+                        "Could not {} {} Playlist tracks: {error}",
+                        if enabled { "unmute" } else { "mute" },
+                        if all_tracks { "all" } else { "the selected" }
+                    );
+                }
+                None => {
+                    self.status = "Open a project to edit Playlist tracks".to_owned();
+                }
+            }
         }
 
         if let Some(grouped) = selected_track_bulk_group_action {

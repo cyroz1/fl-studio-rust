@@ -10643,6 +10643,44 @@ impl FlpDocument {
         self.write_playlist_track_edit(event_index, edit)
     }
 
+    /// Applies the same edit to several Playlist tracks in one arrangement atomically.
+    ///
+    /// Duplicate track IDs are applied once. Every requested track is validated and
+    /// resolved before any state byte changes, so a missing or invalid track leaves
+    /// the project untouched. Returns how many tracks the edit was applied to.
+    pub fn edit_playlist_tracks_in_arrangement(
+        &mut self,
+        arrangement_id: u16,
+        track_ids: &[u32],
+        edit: PlaylistTrackEdit,
+    ) -> Result<usize, FlpError> {
+        let mut unique_track_ids = Vec::new();
+        for track_id in track_ids {
+            Self::validate_playlist_track_edit(*track_id, edit)?;
+            if !unique_track_ids.contains(track_id) {
+                unique_track_ids.push(*track_id);
+            }
+        }
+        if unique_track_ids.is_empty()
+            || (edit.enabled.is_none()
+                && edit.grouped.is_none()
+                && edit.press.is_none()
+                && edit.motion.is_none()
+                && edit.trigger_sync.is_none()
+                && edit.queued.is_none()
+                && edit.position_sync.is_none()
+                && edit.tolerant.is_none())
+        {
+            return Ok(0);
+        }
+        let mut candidate = self.clone();
+        for track_id in &unique_track_ids {
+            candidate.edit_playlist_track_in_arrangement(arrangement_id, *track_id, edit)?;
+        }
+        *self = candidate;
+        Ok(unique_track_ids.len())
+    }
+
     fn validate_playlist_track_edit(
         track_id: u32,
         edit: PlaylistTrackEdit,
@@ -32560,6 +32598,92 @@ mod tests {
             .expect("edited project should encode");
         let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
         assert_eq!(reparsed.playlist_tracks(), document.playlist_tracks());
+    }
+
+    #[test]
+    fn playlist_track_bulk_edits_apply_once_per_track_and_round_trip() {
+        let mut event_stream = vec![0x63, 3, 0];
+        for track_id in 1_u32..=3 {
+            let mut state = vec![0; 70];
+            state[..4].copy_from_slice(&track_id.to_le_bytes());
+            state[12] = 1;
+            state[13] = 0xA5;
+            state[69] = 0xC3;
+            append_data_event(&mut event_stream, 0xEE, &state);
+        }
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let applied = document
+            .edit_playlist_tracks_in_arrangement(
+                3,
+                &[1, 2, 2, 3],
+                PlaylistTrackEdit {
+                    enabled: Some(false),
+                    ..PlaylistTrackEdit::default()
+                },
+            )
+            .expect("bulk mute should apply");
+        assert_eq!(applied, 3);
+        let tracks = document.playlist_tracks();
+        assert_eq!(tracks.len(), 3);
+        assert!(tracks.iter().all(|track| track.enabled == Some(false)));
+        assert!(tracks.iter().all(|track| track.state_bytes[13] == 0xA5));
+        assert!(tracks.iter().all(|track| track.state_bytes[69] == 0xC3));
+
+        let applied = document
+            .edit_playlist_tracks_in_arrangement(
+                3,
+                &[2, 3],
+                PlaylistTrackEdit {
+                    grouped: Some(true),
+                    ..PlaylistTrackEdit::default()
+                },
+            )
+            .expect("bulk grouping should apply");
+        assert_eq!(applied, 2);
+        let tracks = document.playlist_tracks();
+        assert_eq!(tracks[0].grouped, Some(false));
+        assert_eq!(tracks[1].grouped, Some(true));
+        assert_eq!(tracks[2].grouped, Some(true));
+
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap())
+            .expect("bulk-edited Playlist tracks should round-trip");
+        assert_eq!(reparsed.playlist_tracks(), document.playlist_tracks());
+    }
+
+    #[test]
+    fn playlist_track_bulk_edits_are_atomic_when_one_track_is_missing() {
+        let mut event_stream = vec![0x63, 3, 0];
+        for track_id in 1_u32..=2 {
+            let mut state = vec![0; 70];
+            state[..4].copy_from_slice(&track_id.to_le_bytes());
+            state[12] = 1;
+            append_data_event(&mut event_stream, 0xEE, &state);
+        }
+        let input = flp_fixture(&event_stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert!(
+            document
+                .edit_playlist_tracks_in_arrangement(
+                    3,
+                    &[1, 99],
+                    PlaylistTrackEdit {
+                        enabled: Some(false),
+                        ..PlaylistTrackEdit::default()
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
+        assert_eq!(
+            document
+                .edit_playlist_tracks_in_arrangement(3, &[], PlaylistTrackEdit::default())
+                .unwrap(),
+            0
+        );
+        assert_eq!(document.encode_lossless().unwrap(), input);
     }
 
     fn channel_key_region_parameters(low: u32, high: u32) -> Vec<u8> {
