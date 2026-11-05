@@ -146,6 +146,11 @@ mod midi_script;
 #[path = "fl-studio-rebuild/midi_thru.rs"]
 mod midi_thru;
 
+use edison_script::{
+    EdisonScript, EdisonScriptDialogSpec, EdisonScriptInputKind, EdisonScriptRunOutcome,
+    EdisonScriptSample, discover_all_edison_scripts, edison_script_directories,
+    grouped_edison_scripts, load_last_edison_script, run_edison_script, save_last_edison_script,
+};
 use midi_input::{
     ConnectedMidiInput, MidiInputChannelState, MidiInputDevice, MidiInputEvent,
     MidiPatternRecorder, MidiPatternRecorderSettings, MidiThruInputQueue, MidiTransportCommand,
@@ -5364,6 +5369,28 @@ struct PendingSampleEditorPreview {
     worker: thread::JoinHandle<()>,
 }
 
+struct PendingEdisonScript {
+    script_path: PathBuf,
+    script_name: String,
+    editor_path: PathBuf,
+    receiver: Receiver<Result<EdisonScriptRunOutcome, String>>,
+    worker: thread::JoinHandle<()>,
+}
+
+struct EdisonScriptDialogState {
+    script_path: PathBuf,
+    script_name: String,
+    editor_path: PathBuf,
+    spec: EdisonScriptDialogSpec,
+    values: std::collections::BTreeMap<String, f64>,
+}
+
+struct EdisonScriptErrorState {
+    script_path: PathBuf,
+    script_name: String,
+    error: String,
+}
+
 struct SampleEditorRecordingSession {
     receiver: Receiver<Result<AudioRecordingSummary, String>>,
     worker: thread::JoinHandle<()>,
@@ -6310,6 +6337,11 @@ struct DawUi {
     sample_editor_preview_active: bool,
     sample_editor_preview_error: Option<String>,
     sample_editor_recording: Option<SampleEditorRecordingSession>,
+    edison_scripts: Vec<EdisonScript>,
+    edison_script_pending: Option<PendingEdisonScript>,
+    edison_script_dialog: Option<EdisonScriptDialogState>,
+    edison_script_error: Option<EdisonScriptErrorState>,
+    edison_last_script_path: Option<PathBuf>,
     audio_test_tone: bool,
     audio_monitor_input: bool,
     project_info_open: bool,
@@ -9137,6 +9169,17 @@ impl DawUi {
             Ok(devices) => (devices, None),
             Err(error) => (Vec::new(), Some(error)),
         };
+        let edison_scripts = {
+            let home_directory = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from);
+            discover_all_edison_scripts(&edison_script_directories(
+                user_data_directory(),
+                home_directory,
+            ))
+        };
+        let edison_last_script_path =
+            edison_script_settings_file().and_then(|file| load_last_edison_script(&file));
         let (midi_controller_scripts, midi_script_discovery_error) =
             match user_data_directory().map(|root| root.join("Settings").join("Hardware")) {
                 Some(root) => match discover_midi_scripts(&root) {
@@ -9947,6 +9990,11 @@ impl DawUi {
             sample_editor_preview_active: false,
             sample_editor_preview_error: None,
             sample_editor_recording: None,
+            edison_scripts,
+            edison_script_pending: None,
+            edison_script_dialog: None,
+            edison_script_error: None,
+            edison_last_script_path,
             audio_test_tone: false,
             audio_monitor_input: false,
             project_info_open: false,
@@ -31222,6 +31270,7 @@ impl DawUi {
 
     fn request_sample_editor(&mut self, path: PathBuf, ctx: &egui::Context) {
         self.stop_sample_editor_preview();
+        self.refresh_edison_scripts();
         if self.sample_editor_recording.is_some() {
             self.status = "Stop sample editor recording before opening another sample".to_owned();
             return;
@@ -31482,6 +31531,267 @@ impl DawUi {
         }
     }
 
+    fn refresh_edison_scripts(&mut self) {
+        let home_directory = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from);
+        self.edison_scripts = discover_all_edison_scripts(&edison_script_directories(
+            user_data_directory(),
+            home_directory,
+        ));
+    }
+
+    fn start_edison_script(
+        &mut self,
+        script_path: PathBuf,
+        script_name: String,
+        dialog_values: Option<std::collections::BTreeMap<String, f64>>,
+        ctx: &egui::Context,
+    ) {
+        if self.edison_script_pending.is_some() {
+            return;
+        }
+        let Some(editor) = self.sample_editor.as_ref() else {
+            return;
+        };
+        let sample = EdisonScriptSample {
+            sample_rate: editor.audio.sample_rate,
+            channels: editor.audio.channels.clone(),
+        };
+        let selection_start = editor.selection_start;
+        let selection_end = editor.selection_end;
+        let editor_path = editor.path.clone();
+        let (sender, receiver) = mpsc::channel();
+        let worker_path = script_path.clone();
+        let worker = thread::spawn(move || {
+            let result = run_edison_script(
+                &worker_path,
+                &sample,
+                selection_start,
+                selection_end,
+                dialog_values.as_ref(),
+            );
+            let _ = sender.send(result);
+        });
+        self.edison_script_error = None;
+        self.status = format!("Running Edison script {script_name}…");
+        self.edison_script_pending = Some(PendingEdisonScript {
+            script_path,
+            script_name,
+            editor_path,
+            receiver,
+            worker,
+        });
+        ctx.request_repaint_after(Duration::from_millis(40));
+    }
+
+    fn poll_edison_script(&mut self, ctx: &egui::Context) {
+        let completed = self.edison_script_pending.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(TryRecvError::Disconnected) => {
+                    Some(Err("Edison script runner stopped unexpectedly".to_owned()))
+                }
+                Err(TryRecvError::Empty) => None,
+            }
+        });
+        if let Some(result) = completed
+            && let Some(pending) = self.edison_script_pending.take()
+        {
+            let _ = pending.worker.join();
+            match result {
+                Ok(EdisonScriptRunOutcome::Completed {
+                    sample,
+                    messages,
+                    progress,
+                }) => {
+                    self.edison_last_script_path = Some(pending.script_path.clone());
+                    if let Some(settings_file) = edison_script_settings_file() {
+                        let _ = save_last_edison_script(&settings_file, &pending.script_path);
+                    }
+                    let editor_matches = self
+                        .sample_editor
+                        .as_ref()
+                        .is_some_and(|editor| editor.path == pending.editor_path);
+                    if editor_matches {
+                        let audio = DecodedAudio {
+                            sample_rate: sample.sample_rate.max(1),
+                            channels: if sample.channels.is_empty() {
+                                vec![Vec::new()]
+                            } else {
+                                sample.channels
+                            },
+                        };
+                        match summarize_audio_waveform(&audio, 2_048) {
+                            Ok(waveform) => {
+                                let frame_count = audio.frame_count();
+                                if let Some(editor) = self.sample_editor.as_mut() {
+                                    editor.audio = Arc::new(audio);
+                                    editor.waveform = waveform;
+                                    editor.selection_start =
+                                        editor.selection_start.min(frame_count);
+                                    editor.selection_end =
+                                        editor.selection_end.min(frame_count);
+                                    if editor.selection_end <= editor.selection_start {
+                                        editor.selection_start = 0;
+                                        editor.selection_end = frame_count;
+                                    }
+                                }
+                                let mut status =
+                                    format!("Edison script {} finished", pending.script_name);
+                                if let Some((message, position, total)) = &progress {
+                                    status.push_str(&format!(" ({message} {position}/{total})"));
+                                }
+                                if !messages.is_empty() {
+                                    status.push_str(&format!(": {}", messages.join("; ")));
+                                }
+                                self.status = status;
+                            }
+                            Err(error) => {
+                                self.status = format!(
+                                    "Edison script {} produced an unusable sample: {error}",
+                                    pending.script_name
+                                );
+                            }
+                        }
+                    } else {
+                        self.status = format!(
+                            "Edison script {} finished, but the sample editor moved on; result discarded",
+                            pending.script_name
+                        );
+                    }
+                }
+                Ok(EdisonScriptRunOutcome::DialogRequested { dialog }) => {
+                    self.status = format!(
+                        "Edison script {} needs input",
+                        pending.script_name
+                    );
+                    self.edison_script_dialog = Some(EdisonScriptDialogState {
+                        script_path: pending.script_path,
+                        script_name: pending.script_name,
+                        editor_path: pending.editor_path,
+                        values: dialog.default_values(),
+                        spec: dialog,
+                    });
+                }
+                Ok(EdisonScriptRunOutcome::Failed { error }) => {
+                    self.status = format!("Edison script {} failed", pending.script_name);
+                    self.edison_script_error = Some(EdisonScriptErrorState {
+                        script_path: pending.script_path,
+                        script_name: pending.script_name,
+                        error,
+                    });
+                }
+                Err(error) => {
+                    self.status = format!(
+                        "Could not run Edison script {}: {error}",
+                        pending.script_name
+                    );
+                }
+            }
+        }
+        if self.edison_script_pending.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn edison_script_dialog_window(&mut self, ctx: &egui::Context) {
+        if let Some(error) = &self.edison_script_error {
+            let mut close_error = false;
+            let mut run_again = false;
+            let error_script = (error.script_path.clone(), error.script_name.clone());
+            egui::Window::new(format!("Edison script error: {}", error.script_name))
+                .collapsible(false)
+                .resizable(true)
+                .default_size(Vec2::new(520.0, 300.0))
+                .show(ctx, |ui| {
+                    ui.label(
+                        "The script stopped with an error. The sample was not changed.",
+                    );
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.label(egui::RichText::new(&error.error).monospace().small());
+                    });
+                    ui.horizontal(|ui| {
+                        run_again = ui.button("Run again").clicked();
+                        close_error = ui.button("Close").clicked();
+                    });
+                });
+            if run_again {
+                self.edison_script_error = None;
+                self.start_edison_script(error_script.0, error_script.1, None, ctx);
+            } else if close_error {
+                self.edison_script_error = None;
+            }
+            return;
+        }
+        let Some(dialog) = &mut self.edison_script_dialog else {
+            return;
+        };
+        let mut execute = false;
+        let mut cancel = false;
+        let mut open = true;
+        egui::Window::new(dialog.spec.title.clone())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_size(Vec2::new(420.0, 320.0))
+            .show(ctx, |ui| {
+                if !dialog.spec.description.trim().is_empty() {
+                    ui.label(&dialog.spec.description);
+                    ui.separator();
+                }
+                for input in &dialog.spec.inputs {
+                    let value = dialog
+                        .values
+                        .entry(input.name.clone())
+                        .or_insert(input.default);
+                    match input.kind {
+                        EdisonScriptInputKind::Combo => {
+                            let selected = (*value as usize).min(
+                                input.options.len().saturating_sub(1),
+                            );
+                            let mut chosen = selected;
+                            egui::ComboBox::from_label(&input.name)
+                                .selected_text(
+                                    input.options.get(selected).cloned().unwrap_or_default(),
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (index, option) in input.options.iter().enumerate() {
+                                        ui.selectable_value(&mut chosen, index, option);
+                                    }
+                                });
+                            *value = chosen as f64;
+                        }
+                        EdisonScriptInputKind::Knob | EdisonScriptInputKind::Value => {
+                            ui.add(
+                                egui::Slider::new(value, input.minimum..=input.maximum)
+                                    .text(&input.name),
+                            );
+                        }
+                    }
+                }
+                ui.horizontal(|ui| {
+                    execute = ui.button("Execute").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if !open {
+            cancel = true;
+        }
+        if execute {
+            if let Some(dialog) = self.edison_script_dialog.take() {
+                self.start_edison_script(
+                    dialog.script_path,
+                    dialog.script_name,
+                    Some(dialog.values),
+                    ctx,
+                );
+            }
+        } else if cancel {
+            self.edison_script_dialog = None;
+        }
+    }
+
     fn sample_editor_window(&mut self, ctx: &egui::Context) {
         if !self.sample_editor_window_visible {
             return;
@@ -31540,6 +31850,11 @@ impl DawUi {
             .map(|recording| (recording.capture_active, recording.started_at.elapsed()));
         let mut open = true;
         let mut save_selection = false;
+        let mut run_script_choice: Option<EdisonScript> = None;
+        let mut run_last_script = false;
+        let edison_groups = grouped_edison_scripts(&self.edison_scripts);
+        let edison_last_script = self.edison_last_script_path.clone();
+        let edison_script_pending = self.edison_script_pending.is_some();
         let mut preview_selection = false;
         let mut stop_preview = false;
         let mut start_recording = false;
@@ -31561,6 +31876,53 @@ impl DawUi {
                 ui.label(format!(
                     "{channel_label} · {sample_rate} Hz · {duration:.2} seconds"
                 ));
+                ui.horizontal(|ui| {
+                    ui.menu_button("Run script", |ui| {
+                        if edison_groups.is_empty() {
+                            ui.label("No Edison scripts found");
+                            ui.small(
+                                "Save .pyscript files in Settings/Audio scripts to list them here.",
+                            );
+                        }
+                        for (group, scripts) in &edison_groups {
+                            match group {
+                                None => {
+                                    for script in scripts {
+                                        if ui.button(&script.name).clicked() {
+                                            run_script_choice = Some(script.clone());
+                                            ui.close();
+                                        }
+                                    }
+                                }
+                                Some(group_name) => {
+                                    ui.menu_button(group_name, |ui| {
+                                        for script in scripts {
+                                            if ui.button(&script.name).clicked() {
+                                                run_script_choice = Some(script.clone());
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(
+                                edison_last_script.is_some() && !edison_script_pending,
+                                egui::Button::new("Run last script"),
+                            )
+                            .clicked()
+                        {
+                            run_last_script = true;
+                            ui.close();
+                        }
+                    });
+                    if edison_script_pending {
+                        ui.spinner();
+                        ui.small("Running script…");
+                    }
+                });
                 ui.horizontal(|ui| {
                     if let Some((capture_active, elapsed)) = sample_recording_status {
                         if capture_active {
@@ -31724,6 +32086,17 @@ impl DawUi {
             self.stop_sample_editor_recording();
         } else if start_recording {
             self.start_sample_editor_recording(ctx);
+        }
+        if let Some(script) = run_script_choice {
+            self.start_edison_script(script.path, script.name, None, ctx);
+        } else if run_last_script
+            && let Some(path) = self.edison_last_script_path.clone()
+        {
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "script".to_owned());
+            self.start_edison_script(path, name, None, ctx);
         }
         if self.sample_editor_recording.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -84768,7 +85141,9 @@ impl eframe::App for DawUi {
         self.poll_audio_unit_note_preview(ui.ctx());
         self.poll_sample_editor_recording(ui.ctx());
         self.poll_sample_editor(ui.ctx());
+        self.poll_edison_script(ui.ctx());
         self.sample_editor_window(ui.ctx());
+        self.edison_script_dialog_window(ui.ctx());
         self.reap_audio_render_workers();
         self.reap_song_render_workers();
         self.reap_vst3_workers();
@@ -87684,6 +88059,10 @@ fn midi_play_pause_mapping_file() -> Option<PathBuf> {
 
 fn midi_controller_templates_file() -> Option<PathBuf> {
     midi_control_change_mapping_file("midi-controller-templates.txt")
+}
+
+fn edison_script_settings_file() -> Option<PathBuf> {
+    midi_control_change_mapping_file("edison-scripts.txt")
 }
 
 fn midi_control_change_mapping_file(filename: &str) -> Option<PathBuf> {
