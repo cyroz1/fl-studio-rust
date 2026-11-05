@@ -139,6 +139,8 @@ mod audio_unit_probe;
 mod clap_probe;
 mod midi_input;
 mod midi_output;
+#[path = "fl-studio-rebuild/edison_script.rs"]
+mod edison_script;
 #[path = "fl-studio-rebuild/midi_script.rs"]
 mod midi_script;
 #[path = "fl-studio-rebuild/midi_thru.rs"]
