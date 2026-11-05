@@ -258,6 +258,25 @@ const MAX_CAPTURED_PATTERN_CONTROLLER_POINTS: usize = 100_000;
 const MAX_BROWSER_RECURSIVE_SCAN_ENTRIES: usize = 20_000;
 const AUTOSAVE_INTERVALS_MINUTES: [u8; 5] = [0, 1, 5, 10, 15];
 const BACKUP_RETENTION_OPTIONS: [usize; 4] = [5, 10, 20, 50];
+/// The autosave frequency choices shared by the File menu and the Autosave
+/// settings window: (minutes between autosaves, also save before risky
+/// operations, label). Zero minutes disables timed autosaves.
+const AUTOSAVE_PRESETS: [(u8, bool, &str); 6] = [
+    (0, false, "Never"),
+    (15, false, "Rarely · every 15 minutes"),
+    (10, false, "Occasionally · every 10 minutes"),
+    (5, false, "Regularly · every 5 minutes"),
+    (
+        5,
+        true,
+        "Frequently · 5 minutes, including playback; before risky operations",
+    ),
+    (
+        1,
+        true,
+        "Very frequently · every minute and before risky operations",
+    ),
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PlaylistSongOutputFormat {
@@ -6317,6 +6336,7 @@ struct DawUi {
     project_info_genre: String,
     project_info_web_link: String,
     project_settings_open: bool,
+    autosave_settings_open: bool,
     project_settings_advanced_supported: bool,
     project_settings_play_truncated: bool,
     project_settings_fast_declick: bool,
@@ -9954,6 +9974,7 @@ impl DawUi {
             project_info_genre: String::new(),
             project_info_web_link: String::new(),
             project_settings_open: false,
+            autosave_settings_open: false,
             project_settings_advanced_supported: false,
             project_settings_play_truncated: false,
             project_settings_fast_declick: false,
@@ -15176,6 +15197,93 @@ impl DawUi {
         }
     }
 
+    fn autosave_settings_dialog(&mut self, context: &egui::Context) {
+        if !self.autosave_settings_open {
+            return;
+        }
+        let mut open = self.autosave_settings_open;
+        egui::Window::new("Autosave settings")
+            .id(Id::new("autosave-settings-dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .default_width(380.0)
+            .show(context, |ui| {
+                ui.label("Autosave frequency");
+                for (minutes, before_risky, label) in AUTOSAVE_PRESETS {
+                    let selected = self.autosave_minutes == minutes
+                        && self.autosave_before_risky == before_risky;
+                    if ui.selectable_label(selected, label).clicked() && !selected {
+                        self.autosave_minutes = minutes;
+                        self.autosave_before_risky = before_risky;
+                        self.persist_autosave_settings();
+                    }
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Backups to keep");
+                    for count in BACKUP_RETENTION_OPTIONS {
+                        if ui
+                            .selectable_value(&mut self.backup_retention, count, format!("{count}"))
+                            .changed()
+                        {
+                            self.persist_autosave_settings();
+                        }
+                    }
+                });
+                ui.separator();
+                let current_directory = self
+                    .backup_directory
+                    .as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Default user data folder".to_owned());
+                ui.label(format!("Backup location: {current_directory}"));
+                ui.horizontal(|ui| {
+                    if ui.button("Choose folder…").clicked() {
+                        let mut dialog =
+                            rfd::FileDialog::new().set_title("Choose autosave backup folder");
+                        if let Some(directory) = self.backup_directory.as_deref() {
+                            dialog = dialog.set_directory(directory);
+                        }
+                        if let Some(directory) = dialog.pick_folder() {
+                            let previous_directory = self.backup_directory.clone();
+                            self.backup_directory = Some(directory);
+                            if self.persist_autosave_settings() {
+                                self.refresh_last_autosave();
+                            } else {
+                                self.backup_directory = previous_directory;
+                            }
+                        }
+                    }
+                    if self.backup_directory.is_some() && ui.button("Use default folder").clicked()
+                    {
+                        let previous_directory = self.backup_directory.clone();
+                        self.backup_directory = None;
+                        if self.persist_autosave_settings() {
+                            self.refresh_last_autosave();
+                        } else {
+                            self.backup_directory = previous_directory;
+                        }
+                    }
+                });
+                if let Some(last_autosave) = self
+                    .last_autosave_path
+                    .as_ref()
+                    .filter(|path| path.is_file())
+                {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!("Last autosave: {}", last_autosave.display()))
+                            .color(MUTED),
+                    );
+                }
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.autosave_settings_open = false;
+                }
+            });
+        self.autosave_settings_open = self.autosave_settings_open && open;
+    }
+
     fn playlist_render_options_dialog(&mut self, context: &egui::Context) {
         if !self.playlist_render_options_open {
             return;
@@ -19762,22 +19870,7 @@ impl DawUi {
                     format!("Every {} minutes", self.autosave_minutes)
                 };
                 ui.menu_button(format!("Autosave: {autosave_label}"), |ui| {
-                    for (minutes, before_risky, label) in [
-                        (0, false, "Never"),
-                        (15, false, "Rarely · every 15 minutes"),
-                        (10, false, "Occasionally · every 10 minutes"),
-                        (5, false, "Regularly · every 5 minutes"),
-                        (
-                            5,
-                            true,
-                            "Frequently · 5 minutes, including playback; before risky operations",
-                        ),
-                        (
-                            1,
-                            true,
-                            "Very frequently · every minute and before risky operations",
-                        ),
-                    ] {
+                    for (minutes, before_risky, label) in AUTOSAVE_PRESETS {
                         let selected = self.autosave_minutes == minutes
                             && self.autosave_before_risky == before_risky;
                         if ui.selectable_label(selected, label).clicked() && !selected {
@@ -20807,6 +20900,10 @@ impl DawUi {
                 }
                 if ui.button("Audio settings").clicked() {
                     self.toggle_audio_settings_window();
+                    ui.close();
+                }
+                if ui.button("Autosave settings…").clicked() {
+                    self.autosave_settings_open = true;
                     ui.close();
                 }
                 ui.separator();
@@ -33950,17 +34047,6 @@ impl DawUi {
                         .clicked()
                     {
                         selected_track_bulk_action = Some(false);
-                        playlist_track_edits_requested.extend(selected_track_ids.iter().map(
-                            |track_id| {
-                                (
-                                    *track_id,
-                                    PlaylistTrackEdit {
-                                        enabled: Some(false),
-                                        ..PlaylistTrackEdit::default()
-                                    },
-                                )
-                            },
-                        ));
                         ui.close();
                     }
                     if ui
@@ -85996,6 +86082,7 @@ impl eframe::App for DawUi {
         }
         self.project_info_dialog(ui.ctx());
         self.project_settings_dialog(ui.ctx());
+        self.autosave_settings_dialog(ui.ctx());
         self.channel_group_dialog(ui.ctx());
         self.pattern_rename_dialog(ui.ctx());
         self.pattern_delete_dialog(ui.ctx());
