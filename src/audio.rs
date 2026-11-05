@@ -2726,7 +2726,10 @@ enum TransportCommand {
     /// Pause or resume the streaming transport (Pattern, Playlist, and Performance
     /// playback). The generation identifies the stream the request was issued for, so a
     /// command queued for a replaced stream cannot pause or resume its replacement.
-    SetStreamingPaused { generation: u64, paused: bool },
+    SetStreamingPaused {
+        generation: u64,
+        paused: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2880,10 +2883,22 @@ struct AudioErrorState {
     count: AtomicU64,
     xrun_count: AtomicU64,
     events: ArrayQueue<AudioEngineEvent>,
+    pending_events: Mutex<VecDeque<AudioEngineEvent>>,
 }
 
-enum AudioEngineEvent {
+/// An event published by the audio side for the UI through the bounded lock-free
+/// event queue. Meter peaks and live-control values remain atomic snapshots; this
+/// queue carries the state changes the UI reacts to instead of polling for them.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioEngineEvent {
     DeviceStreamError(String),
+    /// Device frames the streamed project source could not supply since the previous
+    /// report, totalled at an output callback block boundary.
+    StreamUnderrun {
+        frames: u64,
+    },
+    /// The streamed project source finished and its queued audio has drained.
+    ProjectStreamFinished,
 }
 
 impl Default for AudioErrorState {
@@ -2894,6 +2909,7 @@ impl Default for AudioErrorState {
             count: AtomicU64::new(0),
             xrun_count: AtomicU64::new(0),
             events: ArrayQueue::new(AUDIO_EVENT_QUEUE_CAPACITY),
+            pending_events: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -2904,7 +2920,10 @@ impl AudioErrorState {
         if is_xrun {
             self.xrun_count.fetch_add(1, Ordering::Relaxed);
         }
-        let event = AudioEngineEvent::DeviceStreamError(message);
+        self.report_event(AudioEngineEvent::DeviceStreamError(message));
+    }
+
+    fn report_event(&self, event: AudioEngineEvent) {
         if let Err(event) = self.events.push(event) {
             self.events.pop();
             let _ = self.events.push(event);
@@ -2923,14 +2942,32 @@ impl AudioErrorState {
             .recent
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending_events = self
+            .pending_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         while let Some(event) = self.events.pop() {
-            let AudioEngineEvent::DeviceStreamError(message) = event;
-            *latest = Some(message.clone());
-            if recent.len() == AUDIO_ERROR_HISTORY_LIMIT {
-                recent.pop_front();
+            if let AudioEngineEvent::DeviceStreamError(message) = &event {
+                *latest = Some(message.clone());
+                if recent.len() == AUDIO_ERROR_HISTORY_LIMIT {
+                    recent.pop_front();
+                }
+                recent.push_back(message.clone());
             }
-            recent.push_back(message);
+            if pending_events.len() == AUDIO_EVENT_QUEUE_CAPACITY {
+                pending_events.pop_front();
+            }
+            pending_events.push_back(event);
         }
+    }
+
+    fn take_events(&self) -> Vec<AudioEngineEvent> {
+        self.drain_events();
+        self.pending_events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
     }
 
     fn take_latest(&self) -> Option<String> {
@@ -2949,6 +2986,49 @@ impl AudioErrorState {
             .iter()
             .cloned()
             .collect()
+    }
+}
+
+/// Block-boundary observer that turns streamed project state changes into engine
+/// events, so the UI can react to underruns and stream completion instead of polling
+/// the stream counters. The first sight of a stream only establishes a baseline, so
+/// state a stream was created with is never reported as a fresh event.
+#[derive(Default)]
+struct StreamEventObserver {
+    generation: u64,
+    underrun_frames: u64,
+    stream_finished: bool,
+}
+
+impl StreamEventObserver {
+    fn observe(
+        &mut self,
+        streaming: Option<&StreamingPlayback>,
+        events: &mut Vec<AudioEngineEvent>,
+    ) {
+        let Some(streaming) = streaming else {
+            *self = Self::default();
+            return;
+        };
+        let underrun_frames = streaming.underrun_frames.load(Ordering::Acquire);
+        let finished =
+            streaming.finished.load(Ordering::Acquire) && streaming.available_stereo_frames() == 0;
+        if streaming.generation != self.generation {
+            self.generation = streaming.generation;
+            self.underrun_frames = underrun_frames;
+            self.stream_finished = finished;
+            return;
+        }
+        if underrun_frames > self.underrun_frames {
+            events.push(AudioEngineEvent::StreamUnderrun {
+                frames: underrun_frames - self.underrun_frames,
+            });
+            self.underrun_frames = underrun_frames;
+        }
+        if finished && !self.stream_finished {
+            events.push(AudioEngineEvent::ProjectStreamFinished);
+        }
+        self.stream_finished = finished;
     }
 }
 
@@ -5404,6 +5484,13 @@ impl AudioEngine {
         self.error.take_latest()
     }
 
+    /// Drain the bounded audio event queue, returning device errors and streamed
+    /// project state changes in the order the audio side published them. Device
+    /// errors also remain available through `take_error` and the error history.
+    pub fn take_events(&self) -> Vec<AudioEngineEvent> {
+        self.error.take_events()
+    }
+
     fn stop_playback_source(&self) {
         if matches!(
             self.requested_source.load(Ordering::Acquire),
@@ -6135,6 +6222,9 @@ where
     let channels = usize::from(config.channels).max(1);
     let mut phase = 0.0_f32;
     let playback_for_callback = Arc::clone(&playback);
+    let error_for_callback = Arc::clone(&error);
+    let mut stream_event_observer = StreamEventObserver::default();
+    let mut stream_events: Vec<AudioEngineEvent> = Vec::new();
     let stream = device
         .build_output_stream::<T, _, _>(
             config,
@@ -6251,6 +6341,10 @@ where
                     u32::try_from(output.len() / channels).unwrap_or(u32::MAX),
                     Ordering::Release,
                 );
+                stream_event_observer.observe(streaming.as_deref(), &mut stream_events);
+                for event in stream_events.drain(..) {
+                    error_for_callback.report_event(event);
+                }
             },
             move |stream_error| set_cpal_stream_error(&error, stream_error),
             Some(Duration::from_secs(5)),
@@ -8162,16 +8256,17 @@ mod tests {
     use cpal::SupportedBufferSize;
 
     use super::{
-        AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR, AUDIO_SOURCE_PROJECT,
-        AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE, AudioAccess,
-        AudioDeviceCatalog, AudioDeviceConfigRange, AudioDeviceInfo, AudioInputRecording,
-        AudioRingBuffer, AudioSettings, InputRecordingState, MixerTrackPeakMeters,
-        ParameterCommand, PlaybackState, ProjectPlaybackClock, STREAM_PREFILL_FRAMES,
-        StagedStreamingPlayback, StereoFrameDelay, TransportCommand, audio_device_config_ranges,
-        buffer_config_preference, create_streaming_playback, enable_denormal_protection,
-        mixer_effect_wet_mix, negotiated_buffer_frames, next_output_frame,
-        output_gain_smoothing_alpha, sanitize_output_sample, smooth_output_gain, tone_sample,
-        valid_project_playback_speed, validate_settings,
+        AUDIO_COMMAND_QUEUE_CAPACITY, AUDIO_EVENT_QUEUE_CAPACITY, AUDIO_SOURCE_INPUT_MONITOR,
+        AUDIO_SOURCE_PROJECT, AUDIO_SOURCE_SILENT, AUDIO_SOURCE_STREAM, AUDIO_SOURCE_TEST_TONE,
+        AudioAccess, AudioDeviceCatalog, AudioDeviceConfigRange, AudioDeviceInfo, AudioEngineEvent,
+        AudioErrorState, AudioInputRecording, AudioRingBuffer, AudioSettings, InputRecordingState,
+        MixerTrackPeakMeters, ParameterCommand, PlaybackState, ProjectPlaybackClock,
+        STREAM_PREFILL_FRAMES, StagedStreamingPlayback, StereoFrameDelay, StreamEventObserver,
+        TransportCommand, audio_device_config_ranges, buffer_config_preference,
+        create_streaming_playback, enable_denormal_protection, mixer_effect_wet_mix,
+        negotiated_buffer_frames, next_output_frame, output_gain_smoothing_alpha,
+        sanitize_output_sample, smooth_output_gain, tone_sample, valid_project_playback_speed,
+        validate_settings,
     };
 
     #[test]
@@ -8872,6 +8967,83 @@ mod tests {
             stream.as_deref().unwrap().paused.load(Ordering::Acquire),
             "the newest queued transport state wins when the queue overflows"
         );
+    }
+
+    #[test]
+    fn engine_events_extend_beyond_device_errors() {
+        let error = AudioErrorState::default();
+        error.report_event(AudioEngineEvent::StreamUnderrun { frames: 128 });
+        error.report("device failed".to_owned(), false);
+        error.report_event(AudioEngineEvent::ProjectStreamFinished);
+
+        assert_eq!(
+            error.take_events(),
+            vec![
+                AudioEngineEvent::StreamUnderrun { frames: 128 },
+                AudioEngineEvent::DeviceStreamError("device failed".to_owned()),
+                AudioEngineEvent::ProjectStreamFinished,
+            ]
+        );
+        assert!(error.take_events().is_empty());
+        // Device errors still land in the latest/history views after the typed drain.
+        assert_eq!(error.take_latest().as_deref(), Some("device failed"));
+        assert_eq!(error.recent(), vec!["device failed".to_owned()]);
+    }
+
+    #[test]
+    fn engine_event_queue_stays_bounded_and_keeps_the_newest_events() {
+        let error = AudioErrorState::default();
+        for frames in 0..AUDIO_EVENT_QUEUE_CAPACITY as u64 + 5 {
+            error.report_event(AudioEngineEvent::StreamUnderrun { frames });
+        }
+        let events = error.take_events();
+        assert_eq!(events.len(), AUDIO_EVENT_QUEUE_CAPACITY);
+        assert_eq!(
+            events.first(),
+            Some(&AudioEngineEvent::StreamUnderrun { frames: 5 })
+        );
+        assert_eq!(
+            events.last(),
+            Some(&AudioEngineEvent::StreamUnderrun {
+                frames: AUDIO_EVENT_QUEUE_CAPACITY as u64 + 4,
+            })
+        );
+    }
+
+    #[test]
+    fn stream_event_observer_reports_underrun_deltas_and_finish_once() {
+        let (playback, _writers) = create_streaming_playback(0, 8, 1, true);
+        let mut observer = StreamEventObserver::default();
+        let mut events = Vec::new();
+
+        observer.observe(Some(&playback), &mut events);
+        assert!(events.is_empty(), "first sight only sets the baseline");
+
+        playback.underrun_frames.fetch_add(96, Ordering::Relaxed);
+        observer.observe(Some(&playback), &mut events);
+        assert_eq!(
+            events,
+            vec![AudioEngineEvent::StreamUnderrun { frames: 96 }]
+        );
+        events.clear();
+
+        playback.underrun_frames.fetch_add(32, Ordering::Relaxed);
+        observer.observe(Some(&playback), &mut events);
+        assert_eq!(
+            events,
+            vec![AudioEngineEvent::StreamUnderrun { frames: 32 }]
+        );
+        events.clear();
+
+        playback.finished.store(true, Ordering::Release);
+        observer.observe(Some(&playback), &mut events);
+        assert_eq!(events, vec![AudioEngineEvent::ProjectStreamFinished]);
+        events.clear();
+
+        observer.observe(Some(&playback), &mut events);
+        assert!(events.is_empty(), "stream finish is reported once");
+        observer.observe(None, &mut events);
+        assert!(events.is_empty());
     }
 
     #[test]
