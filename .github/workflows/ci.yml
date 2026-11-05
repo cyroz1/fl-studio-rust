@@ -116,7 +116,7 @@ jobs:
           done
 
           if [[ "$present" -eq 0 ]]; then
-            echo "::notice::Apple signing secrets are not configured; CI will build, launch, and publish an unsigned macOS disk image."
+            echo "::notice::Apple signing secrets are not configured; CI will build, launch, and publish an ad-hoc signed macOS disk image."
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -1709,7 +1709,7 @@ jobs:
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: cargo packager --release --config Packager.signed.toml
 
-      - name: Configure unsigned macOS disk image
+      - name: Configure ad-hoc signed macOS disk image
         if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
         shell: bash
         run: |
@@ -1721,14 +1721,17 @@ jobs:
           if config.count(old) != 1:
               raise SystemExit("Packager.toml must have one default formats setting")
           config = config.replace(old, 'formats = ["app", "dmg"]')
+          # Ad-hoc signing keeps the downloaded bundle launchable: a fully
+          # unsigned app reads as "damaged" to Gatekeeper on Apple Silicon.
+          config += '\n[macos]\nsigning-identity = "-"\n'
           Path("Packager.macos-smoke.toml").write_text(config, encoding="utf-8")
           PY
 
-      - name: Build unsigned macOS disk image for CI smoke check
+      - name: Build ad-hoc signed macOS disk image for CI smoke check
         if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
         run: cargo packager --release --config Packager.macos-smoke.toml
 
-      - name: Launch unsigned macOS app locally
+      - name: Launch ad-hoc signed macOS app locally
         if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available != 'true'
         shell: bash
         run: |
@@ -1736,7 +1739,7 @@ jobs:
           shopt -s nullglob
           app_bundles=(dist/*.app)
           if (( ${#app_bundles[@]} != 1 )); then
-            echo "::error::Expected exactly one unsigned macOS app bundle; found ${#app_bundles[@]}."
+            echo "::error::Expected exactly one ad-hoc signed macOS app bundle; found ${#app_bundles[@]}."
             printf '%s\n' "${app_bundles[@]}"
             exit 1
           fi
@@ -1744,11 +1747,15 @@ jobs:
           app_executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app_path/Contents/Info.plist")"
           app_binary="$app_path/Contents/MacOS/$app_executable"
           if [[ ! -x "$app_binary" ]]; then
-            echo "::error::The unsigned macOS app executable is missing or not executable."
+            echo "::error::The ad-hoc signed macOS app executable is missing or not executable."
+            exit 1
+          fi
+          if ! codesign --verify --deep --strict "$app_path"; then
+            echo "::error::The ad-hoc signed macOS app bundle failed codesign verification."
             exit 1
           fi
 
-          app_log="$RUNNER_TEMP/fl-studio-unsigned-launch.log"
+          app_log="$RUNNER_TEMP/fl-studio-adhoc-launch.log"
           "$app_binary" > "$app_log" 2>&1 &
           app_pid=$!
           cleanup() {
@@ -1762,7 +1769,7 @@ jobs:
               wait "$app_pid"
               app_status=$?
               set -e
-              echo "::error::The unsigned macOS app exited during launch with status $app_status."
+              echo "::error::The ad-hoc signed macOS app exited during launch with status $app_status."
               cat "$app_log"
               exit 1
             fi

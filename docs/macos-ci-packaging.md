@@ -1,8 +1,8 @@
 # macOS CI packaging
 
-The macOS job runs on Apple Silicon and always uploads one disk image (`.dmg`). When all six Apple signing secrets are configured, CI signs and notarizes it, installs and launches the app from the image, and validates its stapled tickets and Gatekeeper acceptance. With no signing secrets, CI launches the unsigned app locally as a smoke check and uploads the unsigned disk image. App bundles, screenshots, and intermediate files are not uploaded.
+The macOS job runs on Apple Silicon and always uploads one disk image (`.dmg`). When all six Apple signing secrets are configured, CI signs and notarizes it, installs and launches the app from the image, and validates its stapled tickets and Gatekeeper acceptance. With no signing secrets, CI ad-hoc signs the app (codesign identity "-"), launches it locally as a smoke check, verifies the bundle signature, and uploads the ad-hoc signed disk image. An ad-hoc signed download is not notarized, so Gatekeeper still asks for an explicit Open Anyway on first launch, but it no longer reports the app as damaged the way a fully unsigned Apple Silicon bundle is. App bundles, screenshots, and intermediate files are not uploaded.
 
-Signed macOS distribution requires all six Apple signing and notarization secrets below. With no secrets configured, CI publishes an unsigned Apple Silicon disk image after a local app smoke check. A partially configured set fails before packaging so misconfigured signing cannot silently fall back to an unsigned build. Add the secrets under **Settings → Secrets and variables → Actions**:
+Signed macOS distribution requires all six Apple signing and notarization secrets below. With no secrets configured, CI publishes an ad-hoc signed Apple Silicon disk image after a local app smoke check. A partially configured set fails before packaging so misconfigured signing cannot silently fall back to an ad-hoc build. Add the secrets under **Settings → Secrets and variables → Actions**:
 
 | Secret | Value |
 |---|---|
