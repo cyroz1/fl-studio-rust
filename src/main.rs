@@ -8054,7 +8054,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
     println!("channels: {}", channels.len());
     for channel in channels {
         println!(
-            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_filter_cutoff_raw={:?} sampler_filter_resonance_raw={:?} sampler_filter_type_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} automation_range_raw={:?} level_adjusts_raw={:?} midi_out_settings={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
+            "id={} kind={} type={:?} enabled={} zipped={} main_pitch={} add_to_key={} fine_tune_raw={:?} key_region={:?} stretch_settings={:?} sampler_fade_out_raw={:?} sampler_fade_in_raw={:?} sampler_filter_cutoff_raw={:?} sampler_filter_resonance_raw={:?} sampler_filter_type_raw={:?} sample_fade_stereo={} sample_swap_stereo={} sample_remove_dc={} sample_normalize={} sample_reverse_polarity={} sample_reversed={} sample_start_fraction={:?} sample_length_fraction={:?} sample_trim_threshold_raw={:?} sample_crossfade_raw={:?} sampler_portamento={:?} sampler_polyphony_slide_raw={:?} sampler_volume_envelope={:?} sampler_envelopes={:?} color={:?} volume={:?} pan={:?} automation_range_raw={:?} level_adjusts_raw={:?} midi_out_settings={:?} swing_mix_raw={:?} layer_children={:?} layer_flags={:?} plugin={} name={} sample_path={:?} events={:?}",
             channel.id(),
             channel
                 .kind()
@@ -8079,6 +8079,7 @@ fn list_channels(path: &Path) -> Result<(), String> {
             channel.sample_remove_dc_enabled(),
             channel.sample_normalize_enabled(),
             channel.sample_reverse_polarity_enabled(),
+            channel.sample_reversed() || channel.audio_clip_reversed(),
             channel.sample_start_fraction(),
             channel.sample_length_fraction(),
             channel.sample_trim_threshold_raw(),

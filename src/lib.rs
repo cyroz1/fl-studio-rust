@@ -6416,7 +6416,8 @@ impl PlaylistClip {
     }
 
     /// The 88-byte Playlist record tail is preserved verbatim except for the
-    /// decoded tick source window and candidate mute flag; other fields remain
+    /// decoded tick source window, the flags word (which carries the candidate
+    /// mute flag), and the other header fields; the remaining tail fields stay
     /// opaque.
     pub fn has_opaque_record_tail(&self) -> bool {
         self.record_size == 88
@@ -12375,13 +12376,10 @@ impl FlpDocument {
         let record_size = clip.record_size;
 
         if clip.has_opaque_record_tail()
-            && (edit.item_flags.is_some()
-                || edit.start_offset.is_some()
-                || edit.end_offset.is_some()
-                || edit.scale.is_some())
+            && (edit.start_offset.is_some() || edit.end_offset.is_some() || edit.scale.is_some())
         {
             return Err(FlpError::UnsupportedEdit(
-                "this Playlist record version keeps clip flags, source offsets, and scale in opaque fields",
+                "this Playlist record version keeps source offsets and scale in opaque fields",
             ));
         }
         let mut edits_audio_clip_window = false;
@@ -29922,7 +29920,7 @@ fn decode_playlist_clip(
         },
         group: u16_at(14),
         unknown_word: if modern_record { 0 } else { u16_at(16) },
-        item_flags: if modern_record { 0 } else { u16_at(18) },
+        item_flags: u16_at(18),
         muted: u16_at(18) & PLAYLIST_CLIP_MUTED_FLAG != 0,
         header_bytes: if modern_record {
             [0; 4]
@@ -34350,14 +34348,56 @@ mod tests {
                     0,
                     0,
                     PlaylistClipEdit {
-                        item_flags: Some(PLAYLIST_CLIP_MUTED_FLAG),
+                        scale: Some(2.0),
                         ..PlaylistClipEdit::default()
                     },
                 )
                 .is_err(),
-            "raw flags remain unavailable while the modern record tail is opaque"
+            "scale remains unavailable while the modern record tail is opaque"
+        );
+        assert!(
+            document
+                .edit_playlist_clip(
+                    0,
+                    0,
+                    PlaylistClipEdit {
+                        start_offset: Some(0.25),
+                        ..PlaylistClipEdit::default()
+                    },
+                )
+                .is_err(),
+            "source offsets remain unavailable while the modern record tail is opaque"
         );
         assert_eq!(document.encode_lossless().unwrap(), before_rejected_edit);
+
+        for (clip, expected_tail) in clips[0].clips.iter().zip(&original_tails) {
+            let stored_flags = u16::from_le_bytes([expected_tail[2], expected_tail[3]]);
+            assert_eq!(
+                clip.item_flags, stored_flags,
+                "the modern record flags word should decode from offset 18"
+            );
+        }
+        document
+            .edit_playlist_clip(
+                0,
+                2,
+                PlaylistClipEdit {
+                    item_flags: Some(0x0041),
+                    ..PlaylistClipEdit::default()
+                },
+            )
+            .expect("the raw flags word should be editable without decoding the tail");
+        let flagged = document
+            .arrangements()
+            .expect("the edited project should decode");
+        assert_eq!(flagged[0].clips[2].item_flags, 0x0041);
+        assert!(!flagged[0].clips[2].is_muted());
+        let mut expected_flagged_tail = original_tails[2].clone();
+        expected_flagged_tail[2..4].copy_from_slice(&0x0041u16.to_le_bytes());
+        assert_eq!(
+            flagged[0].clips[2].reserved, expected_flagged_tail,
+            "a raw flags edit should change only the flags word in the modern tail"
+        );
 
         document
             .edit_playlist_clip(
