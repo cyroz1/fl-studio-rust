@@ -398,6 +398,20 @@ pub struct AudioExportOptions {
     pub fade_out_frames: usize,
     pub reverse: bool,
     pub normalization_target_dbfs: Option<f32>,
+    /// Optional spectral band gain applied to the processed selection.
+    pub spectral_band_gain: Option<SpectralBandGain>,
+}
+
+/// A frequency-band gain edit applied in the spectral domain.
+///
+/// The gain is flat between `low_hz` and `high_hz` with raised-cosine ramps of
+/// one third of an octave on either side, so edits do not ring at the band
+/// edges. Frequencies outside the ramps keep a factor of exactly 1.0.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpectralBandGain {
+    pub low_hz: f32,
+    pub high_hz: f32,
+    pub gain_db: f32,
 }
 
 impl Default for AudioExportOptions {
@@ -409,6 +423,7 @@ impl Default for AudioExportOptions {
             fade_out_frames: 0,
             reverse: false,
             normalization_target_dbfs: None,
+            spectral_band_gain: None,
         }
     }
 }
@@ -423,7 +438,10 @@ pub fn write_audio_range_to_wav_with_options(
     options: AudioExportOptions,
     output_path: impl AsRef<Path>,
 ) -> Result<(), String> {
-    if options.pitch_shift_semitones == 0.0 && options.stretch_ratio == 1.0 {
+    if options.pitch_shift_semitones == 0.0
+        && options.stretch_ratio == 1.0
+        && options.spectral_band_gain.is_none()
+    {
         return write_audio_range_to_wav_with_processing(
             audio,
             frame_range,
@@ -442,12 +460,15 @@ pub fn write_audio_range_to_wav_with_options(
     {
         return Err("processed audio output must use the .wav extension".to_owned());
     }
-    let processed_audio = process_audio_range(
+    let mut processed_audio = process_audio_range(
         audio,
         frame_range,
         options.pitch_shift_semitones,
         options.stretch_ratio,
     )?;
+    if let Some(band) = options.spectral_band_gain {
+        processed_audio = apply_spectral_band_gain(&processed_audio, band)?;
+    }
     let frame_count = processed_audio.frame_count();
     write_audio_range_to_wav_with_processing(
         &processed_audio,
@@ -458,6 +479,213 @@ pub fn write_audio_range_to_wav_with_options(
         options.normalization_target_dbfs,
         output_path,
     )
+}
+
+const SPECTRAL_WINDOW_FRAMES: usize = 4096;
+const SPECTRAL_HOP_FRAMES: usize = SPECTRAL_WINDOW_FRAMES / 4;
+
+/// Apply a spectral band gain to every channel of decoded audio.
+///
+/// The audio is processed with a Hann-windowed short-time Fourier transform
+/// (4096-frame windows, 1024-frame hop) and overlap-add reconstruction. The
+/// selection is padded with one window of silence on both ends so the frames
+/// at its edges receive full window coverage. The source buffer is never
+/// modified.
+pub fn apply_spectral_band_gain(
+    audio: &DecodedAudio,
+    band: SpectralBandGain,
+) -> Result<DecodedAudio, String> {
+    if !(8_000..=384_000).contains(&audio.sample_rate) {
+        return Err("sample rate must be between 8,000 and 384,000 Hz".to_owned());
+    }
+    let channel_count = audio.channels.len();
+    if channel_count == 0 || channel_count > 8 {
+        return Err("spectral editing supports between 1 and 8 channels".to_owned());
+    }
+    let frame_count = audio.frame_count();
+    if frame_count == 0
+        || audio
+            .channels
+            .iter()
+            .any(|channel| channel.len() != frame_count)
+    {
+        return Err("audio channels must have the same nonzero frame count".to_owned());
+    }
+    if frame_count * channel_count > MAX_SAMPLE_EDITOR_PROCESSING_SAMPLES {
+        return Err("selection exceeds the 16-million-sample processing limit".to_owned());
+    }
+    if !band.low_hz.is_finite() || !band.high_hz.is_finite() || !band.gain_db.is_finite() {
+        return Err("spectral band values must be finite".to_owned());
+    }
+    if band.low_hz < 20.0 || band.high_hz <= band.low_hz {
+        return Err("spectral band must satisfy 20 Hz <= low < high".to_owned());
+    }
+    if band.high_hz > audio.sample_rate as f32 / 2.0 {
+        return Err("spectral band high edge must not exceed the Nyquist frequency".to_owned());
+    }
+    if !(-60.0..=24.0).contains(&band.gain_db) {
+        return Err("spectral band gain must be between -60 and +24 dB".to_owned());
+    }
+    if band.gain_db == 0.0 {
+        return Ok(audio.clone());
+    }
+    let channels = audio
+        .channels
+        .iter()
+        .map(|channel| spectral_band_gain_channel(channel, audio.sample_rate, band))
+        .collect();
+    Ok(DecodedAudio {
+        sample_rate: audio.sample_rate,
+        channels,
+    })
+}
+
+/// Multiplicative gain the spectral band edit applies at one frequency.
+fn spectral_band_gain_factor(band: SpectralBandGain, frequency_hz: f64) -> f64 {
+    if frequency_hz <= 0.0 {
+        return 1.0;
+    }
+    let gain = 10.0_f64.powf(f64::from(band.gain_db) / 20.0);
+    // One-third-octave raised-cosine ramps keep the band edges from ringing.
+    let transition = 2.0_f64.powf(1.0 / 3.0);
+    let low = f64::from(band.low_hz);
+    let high = f64::from(band.high_hz);
+    let ramp_up = raised_cosine_ramp(frequency_hz, low / transition, low * transition);
+    let ramp_down = 1.0 - raised_cosine_ramp(frequency_hz, high / transition, high * transition);
+    1.0 + (gain - 1.0) * ramp_up * ramp_down
+}
+
+fn raised_cosine_ramp(frequency_hz: f64, start_hz: f64, end_hz: f64) -> f64 {
+    if frequency_hz <= start_hz {
+        0.0
+    } else if frequency_hz >= end_hz {
+        1.0
+    } else {
+        let t = (frequency_hz.ln() - start_hz.ln()) / (end_hz.ln() - start_hz.ln());
+        0.5 - 0.5 * (std::f64::consts::PI * t).cos()
+    }
+}
+
+fn spectral_band_gain_channel(samples: &[f32], sample_rate: u32, band: SpectralBandGain) -> Vec<f32> {
+    let frame_count = samples.len();
+    let window = SPECTRAL_WINDOW_FRAMES;
+    let hop = SPECTRAL_HOP_FRAMES;
+    let padded_len = frame_count + 2 * window;
+    let mut output = vec![0.0_f32; padded_len];
+    let mut envelope = vec![0.0_f32; padded_len];
+    let hann: Vec<f32> = (0..window)
+        .map(|index| {
+            (0.5 - 0.5 * (2.0 * std::f64::consts::PI * index as f64 / (window - 1) as f64).cos())
+                as f32
+        })
+        .collect();
+    let mut real = vec![0.0_f32; window];
+    let mut imaginary = vec![0.0_f32; window];
+    let mut start = 0;
+    while start < padded_len {
+        for (offset, (real_slot, imaginary_slot)) in
+            real.iter_mut().zip(imaginary.iter_mut()).enumerate()
+        {
+            let index = start + offset;
+            let sample = if index >= window && index < window + frame_count {
+                let sample = samples[index - window];
+                if sample.is_finite() { sample } else { 0.0 }
+            } else {
+                0.0
+            };
+            *real_slot = sample * hann[offset];
+            *imaginary_slot = 0.0;
+        }
+        fft_in_place(&mut real, &mut imaginary, false);
+        for bin in 0..window {
+            let mirror = if bin <= window / 2 {
+                bin
+            } else {
+                window - bin
+            };
+            let frequency = f64::from(mirror as u32) * f64::from(sample_rate) / window as f64;
+            let factor = spectral_band_gain_factor(band, frequency) as f32;
+            real[bin] *= factor;
+            imaginary[bin] *= factor;
+        }
+        fft_in_place(&mut real, &mut imaginary, true);
+        for offset in 0..window {
+            let index = start + offset;
+            if index < padded_len {
+                output[index] += real[offset] * hann[offset];
+                envelope[index] += hann[offset] * hann[offset];
+            }
+        }
+        start += hop;
+    }
+    (0..frame_count)
+        .map(|index| {
+            let padded_index = index + window;
+            let coverage = envelope[padded_index];
+            if coverage > 1.0e-6 {
+                output[padded_index] / coverage
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
+/// In-place iterative radix-2 FFT over parallel real/imaginary slices.
+/// The inverse transform includes the 1/N scaling, so a forward/inverse pair
+/// reconstructs the input.
+fn fft_in_place(real: &mut [f32], imaginary: &mut [f32], inverse: bool) {
+    let len = real.len();
+    debug_assert!(len.is_power_of_two() && imaginary.len() == len);
+    let mut reversed = 0;
+    for index in 1..len {
+        let mut bit = len >> 1;
+        while reversed & bit != 0 {
+            reversed ^= bit;
+            bit >>= 1;
+        }
+        reversed ^= bit;
+        if index < reversed {
+            real.swap(index, reversed);
+            imaginary.swap(index, reversed);
+        }
+    }
+    let mut stage_size = 2;
+    while stage_size <= len {
+        let angle =
+            (if inverse { 2.0 } else { -2.0 }) * std::f64::consts::PI / stage_size as f64;
+        let step_real = angle.cos();
+        let step_imaginary = angle.sin();
+        for stage_start in (0..len).step_by(stage_size) {
+            let mut twiddle_real = 1.0_f64;
+            let mut twiddle_imaginary = 0.0_f64;
+            for offset in 0..stage_size / 2 {
+                let even = stage_start + offset;
+                let odd = even + stage_size / 2;
+                let even_real = f64::from(real[even]);
+                let even_imaginary = f64::from(imaginary[even]);
+                let odd_real = f64::from(real[odd]) * twiddle_real
+                    - f64::from(imaginary[odd]) * twiddle_imaginary;
+                let odd_imaginary = f64::from(real[odd]) * twiddle_imaginary
+                    + f64::from(imaginary[odd]) * twiddle_real;
+                real[odd] = (even_real - odd_real) as f32;
+                imaginary[odd] = (even_imaginary - odd_imaginary) as f32;
+                real[even] = (even_real + odd_real) as f32;
+                imaginary[even] = (even_imaginary + odd_imaginary) as f32;
+                let next_real = twiddle_real * step_real - twiddle_imaginary * step_imaginary;
+                twiddle_imaginary = twiddle_real * step_imaginary + twiddle_imaginary * step_real;
+                twiddle_real = next_real;
+            }
+        }
+        stage_size *= 2;
+    }
+    if inverse {
+        let scale = 1.0 / len as f32;
+        for (real_slot, imaginary_slot) in real.iter_mut().zip(imaginary.iter_mut()) {
+            *real_slot *= scale;
+            *imaginary_slot *= scale;
+        }
+    }
 }
 
 fn process_audio_range(
@@ -626,6 +854,9 @@ pub fn process_audio_range_to_stereo_preview(
         options.pitch_shift_semitones,
         options.stretch_ratio,
     )?;
+    if let Some(band) = options.spectral_band_gain {
+        processed = apply_spectral_band_gain(&processed, band)?;
+    }
     let frame_count = processed.frame_count();
     if options.fade_in_frames > frame_count || options.fade_out_frames > frame_count {
         return Err("fade lengths cannot exceed the selected frame range".to_owned());
@@ -2541,6 +2772,190 @@ mod tests {
                 .all(|(stereo, mono)| (stereo[0] - mono).abs() < 1.0e-6 && stereo[0] == stereo[1])
         );
         assert_eq!(audio, original);
+        fs::remove_dir_all(root).expect("fixture directory should be removed");
+    }
+
+    /// Hann-windowed DFT magnitude at one exact frequency, measured over the
+    /// middle of the buffer so STFT edge coverage does not skew the result.
+    fn tone_magnitude(samples: &[f32], sample_rate: u32, frequency_hz: f64) -> f64 {
+        let measure_len = 16_384.min(samples.len());
+        let start = (samples.len() - measure_len) / 2;
+        let mut real = 0.0_f64;
+        let mut imaginary = 0.0_f64;
+        let mut window_sum = 0.0_f64;
+        for (offset, &sample) in samples[start..start + measure_len].iter().enumerate() {
+            let window = 0.5
+                - 0.5
+                    * (2.0 * std::f64::consts::PI * offset as f64 / (measure_len - 1) as f64)
+                        .cos();
+            let angle = 2.0 * std::f64::consts::PI * frequency_hz * offset as f64
+                / f64::from(sample_rate);
+            real += f64::from(sample) * window * angle.cos();
+            imaginary -= f64::from(sample) * window * angle.sin();
+            window_sum += window;
+        }
+        2.0 * (real * real + imaginary * imaginary).sqrt() / window_sum
+    }
+
+    fn two_tone_audio(sample_rate: u32, frames: usize) -> DecodedAudio {
+        let channel = (0..frames)
+            .map(|index| {
+                let t = index as f64 / f64::from(sample_rate);
+                0.4 * (2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32
+                    + 0.4 * (2.0 * std::f64::consts::PI * 4_000.0 * t).sin() as f32
+            })
+            .collect();
+        DecodedAudio {
+            sample_rate,
+            channels: vec![channel],
+        }
+    }
+
+    #[test]
+    fn spectral_band_gain_cuts_only_the_target_band() {
+        let audio = two_tone_audio(48_000, 48_000);
+        let original = audio.clone();
+        let before_low = tone_magnitude(&audio.channels[0], 48_000, 440.0);
+        let before_high = tone_magnitude(&audio.channels[0], 48_000, 4_000.0);
+
+        let processed = apply_spectral_band_gain(
+            &audio,
+            SpectralBandGain {
+                low_hz: 3_000.0,
+                high_hz: 5_000.0,
+                gain_db: -30.0,
+            },
+        )
+        .expect("spectral cut should apply");
+
+        assert_eq!(processed.frame_count(), audio.frame_count());
+        let after_low = tone_magnitude(&processed.channels[0], 48_000, 440.0);
+        let after_high = tone_magnitude(&processed.channels[0], 48_000, 4_000.0);
+        let low_change_db = 20.0 * (after_low / before_low).log10();
+        let high_change_db = 20.0 * (after_high / before_high).log10();
+        assert!(
+            (-1.0..=1.0).contains(&low_change_db),
+            "440 Hz tone should be nearly unchanged, changed by {low_change_db} dB"
+        );
+        assert!(
+            high_change_db < -24.0,
+            "4 kHz tone should be cut by about 30 dB, changed by {high_change_db} dB"
+        );
+        assert_eq!(audio, original, "source audio must not be modified");
+    }
+
+    #[test]
+    fn spectral_band_gain_boosts_only_the_target_band() {
+        let audio = two_tone_audio(48_000, 48_000);
+        let before_low = tone_magnitude(&audio.channels[0], 48_000, 440.0);
+        let before_high = tone_magnitude(&audio.channels[0], 48_000, 4_000.0);
+
+        let processed = apply_spectral_band_gain(
+            &audio,
+            SpectralBandGain {
+                low_hz: 300.0,
+                high_hz: 600.0,
+                gain_db: 12.0,
+            },
+        )
+        .expect("spectral boost should apply");
+
+        let after_low = tone_magnitude(&processed.channels[0], 48_000, 440.0);
+        let after_high = tone_magnitude(&processed.channels[0], 48_000, 4_000.0);
+        let low_change_db = 20.0 * (after_low / before_low).log10();
+        let high_change_db = 20.0 * (after_high / before_high).log10();
+        assert!(
+            (10.5..=13.5).contains(&low_change_db),
+            "440 Hz tone should be boosted by about 12 dB, changed by {low_change_db} dB"
+        );
+        assert!(
+            (-1.0..=1.0).contains(&high_change_db),
+            "4 kHz tone should be nearly unchanged, changed by {high_change_db} dB"
+        );
+    }
+
+    #[test]
+    fn spectral_band_gain_rejects_invalid_bands() {
+        let audio = two_tone_audio(48_000, 4_096);
+        for band in [
+            SpectralBandGain {
+                low_hz: 500.0,
+                high_hz: 500.0,
+                gain_db: -6.0,
+            },
+            SpectralBandGain {
+                low_hz: 10.0,
+                high_hz: 500.0,
+                gain_db: -6.0,
+            },
+            SpectralBandGain {
+                low_hz: 500.0,
+                high_hz: 30_000.0,
+                gain_db: -6.0,
+            },
+            SpectralBandGain {
+                low_hz: 500.0,
+                high_hz: 1_000.0,
+                gain_db: -90.0,
+            },
+            SpectralBandGain {
+                low_hz: 500.0,
+                high_hz: 1_000.0,
+                gain_db: f32::NAN,
+            },
+        ] {
+            assert!(
+                apply_spectral_band_gain(&audio, band).is_err(),
+                "band {band:?} should be rejected"
+            );
+        }
+        let unchanged = apply_spectral_band_gain(
+            &audio,
+            SpectralBandGain {
+                low_hz: 500.0,
+                high_hz: 1_000.0,
+                gain_db: 0.0,
+            },
+        )
+        .expect("a 0 dB band gain should succeed");
+        assert_eq!(unchanged, audio);
+    }
+
+    #[test]
+    fn spectral_band_gain_flows_through_editor_export_options() {
+        let root = fixture_root();
+        fs::create_dir_all(&root).expect("fixture directory should be created");
+        let output_path = root.join("spectral-export.wav");
+        let audio = two_tone_audio(48_000, 48_000);
+        let options = AudioExportOptions {
+            spectral_band_gain: Some(SpectralBandGain {
+                low_hz: 3_000.0,
+                high_hz: 5_000.0,
+                gain_db: -30.0,
+            }),
+            ..AudioExportOptions::default()
+        };
+
+        write_audio_range_to_wav_with_options(&audio, 0..48_000, options, &output_path)
+            .expect("spectral selection should export");
+        let exported = decode_audio_file(&output_path).expect("export should decode");
+        let before_high = tone_magnitude(&audio.channels[0], 48_000, 4_000.0);
+        let after_high = tone_magnitude(&exported.channels[0], 48_000, 4_000.0);
+        let high_change_db = 20.0 * (after_high / before_high).log10();
+        assert!(
+            high_change_db < -24.0,
+            "exported 4 kHz tone should be cut, changed by {high_change_db} dB"
+        );
+
+        let preview = process_audio_range_to_stereo_preview(&audio, 0..48_000, options, 48_000)
+            .expect("spectral selection should preview");
+        let preview_mono: Vec<f32> = preview.chunks_exact(2).map(|frame| frame[0]).collect();
+        let preview_high = tone_magnitude(&preview_mono, 48_000, 4_000.0);
+        let preview_change_db = 20.0 * (preview_high / before_high).log10();
+        assert!(
+            preview_change_db < -24.0,
+            "previewed 4 kHz tone should be cut, changed by {preview_change_db} dB"
+        );
         fs::remove_dir_all(root).expect("fixture directory should be removed");
     }
 

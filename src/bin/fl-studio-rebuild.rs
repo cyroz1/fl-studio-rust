@@ -32,7 +32,7 @@ use flp_rebuild::audio::{
 };
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, BrowserPreviewPitch, DecodedAudio, SampleKeyMetadata,
-    SamplePathResolver, WaveformPeak, decode_audio_file, decode_audio_preview,
+    SamplePathResolver, SpectralBandGain, WaveformPeak, decode_audio_file, decode_audio_preview,
     decode_audio_waveform, decode_browser_preview, find_empty_project_template,
     process_audio_range_to_stereo_preview, sample_key_metadata, summarize_audio_waveform,
     wave_acid_loop_tempo_metadata, write_audio_range_to_wav_with_options,
@@ -5385,6 +5385,31 @@ struct SampleEditorState {
     normalize_export: bool,
     normalization_target_dbfs: f32,
     reverse_export: bool,
+    spectral_band_enabled: bool,
+    spectral_band_low_hz: f32,
+    spectral_band_high_hz: f32,
+    spectral_band_gain_db: f32,
+}
+
+impl SampleEditorState {
+    /// The spectral band edit to include in preview/export processing, if the
+    /// user enabled it and the band is usable at this sample rate.
+    fn spectral_band_gain(&self) -> Option<SpectralBandGain> {
+        if !self.spectral_band_enabled {
+            return None;
+        }
+        let nyquist = self.audio.sample_rate as f32 / 2.0;
+        let low_hz = self.spectral_band_low_hz.clamp(20.0, nyquist);
+        let high_hz = self.spectral_band_high_hz.clamp(low_hz * 1.01, nyquist);
+        if high_hz <= low_hz || !(20.0..=nyquist).contains(&low_hz) {
+            return None;
+        }
+        Some(SpectralBandGain {
+            low_hz,
+            high_hz,
+            gain_db: self.spectral_band_gain_db,
+        })
+    }
 }
 
 struct PendingBackupWrite {
@@ -31292,6 +31317,7 @@ impl DawUi {
             normalization_target_dbfs: editor
                 .normalize_export
                 .then_some(editor.normalization_target_dbfs),
+            spectral_band_gain: editor.spectral_band_gain(),
         };
 
         if self.audio_engine.is_none() {
@@ -31464,6 +31490,10 @@ impl DawUi {
                         normalize_export: false,
                         normalization_target_dbfs: 0.0,
                         reverse_export: false,
+                        spectral_band_enabled: false,
+                        spectral_band_low_hz: 200.0,
+                        spectral_band_high_hz: 8_000.0,
+                        spectral_band_gain_db: -12.0,
                     });
                 }
                 Err(error) => {
@@ -31638,7 +31668,7 @@ impl DawUi {
                     );
                 });
                 if editor.audio.channels.len() > 2 {
-                    ui.small("Pitch shift and time stretch are available for mono and stereo samples.");
+                    ui.small("Pitch shift, time stretch, and spectral band gain are available for mono and stereo samples.");
                 } else {
                     ui.small("1.00× keeps duration; above 1 lengthens, below 1 shortens. Stretch preserves pitch and uses transient detection.");
                 }
@@ -31664,6 +31694,38 @@ impl DawUi {
                     );
                 });
                 ui.checkbox(&mut editor.reverse_export, "Reverse selection on export");
+                ui.add_enabled_ui(editor.audio.channels.len() <= 2, |ui| {
+                    ui.checkbox(&mut editor.spectral_band_enabled, "Spectral band gain");
+                    if editor.spectral_band_enabled {
+                        let nyquist = (editor.audio.sample_rate as f32 / 2.0).max(40.0);
+                        editor.spectral_band_low_hz =
+                            editor.spectral_band_low_hz.clamp(20.0, nyquist);
+                        editor.spectral_band_high_hz = editor
+                            .spectral_band_high_hz
+                            .clamp(editor.spectral_band_low_hz * 1.01, nyquist);
+                        ui.add(
+                            egui::Slider::new(
+                                &mut editor.spectral_band_low_hz,
+                                20.0..=nyquist,
+                            )
+                            .logarithmic(true)
+                            .text("Band low (Hz)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut editor.spectral_band_high_hz,
+                                20.0..=nyquist,
+                            )
+                            .logarithmic(true)
+                            .text("Band high (Hz)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut editor.spectral_band_gain_db, -60.0..=24.0)
+                                .step_by(0.1)
+                                .text("Band gain (dB)"),
+                        );
+                    }
+                });
                 ui.horizontal(|ui| {
                     preview_selection = ui
                         .add_enabled(
@@ -31671,7 +31733,7 @@ impl DawUi {
                             egui::Button::new("▶ Preview processed selection"),
                         )
                         .on_hover_text(
-                            "Audition the selected range with the current pitch, stretch, fade, normalization, and reverse settings",
+                            "Audition the selected range with the current pitch, stretch, spectral band, fade, normalization, and reverse settings",
                         )
                         .clicked();
                     if preview_pending || preview_active {
@@ -31696,7 +31758,7 @@ impl DawUi {
                     {
                         save_selection = true;
                     }
-                    ui.small("Pitch, time stretch, fades, normalization, and reversal apply to the export; the source stays unchanged.");
+                    ui.small("Pitch, time stretch, spectral band gain, fades, normalization, and reversal apply to the export; the source stays unchanged.");
                 });
                 if export_pending {
                     ui.horizontal(|ui| {
@@ -31791,6 +31853,7 @@ impl DawUi {
             normalization_target_dbfs: editor
                 .normalize_export
                 .then_some(editor.normalization_target_dbfs),
+            spectral_band_gain: editor.spectral_band_gain(),
         };
         let worker_output_path = output_path.clone();
         let (sender, receiver) = mpsc::channel();
