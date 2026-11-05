@@ -2078,6 +2078,45 @@ impl WindowLayoutPreset {
     }
 }
 
+/// The region a window can plausibly occupy given the monitor hosting the
+/// main window. egui reports only that monitor's size, and the monitor's
+/// rect must contain the main window's outer rect, so the union of candidate
+/// monitor rects is the main rect expanded by the size difference per side.
+fn monitor_visible_region(main_rect: egui::Rect, monitor_size: Vec2) -> egui::Rect {
+    let slack = egui::vec2(
+        (monitor_size.x - main_rect.width()).max(0.0),
+        (monitor_size.y - main_rect.height()).max(0.0),
+    );
+    egui::Rect::from_min_max(main_rect.min - slack, main_rect.max + slack)
+}
+
+/// Drop a saved detached-window position that can no longer be on a
+/// connected monitor (for example after a display is unplugged), keeping the
+/// saved size. Without a position the window manager places the window
+/// visibly, and the placement capture then records where it landed. A
+/// position is kept when at least a grabbable part of the window (100x32
+/// points) intersects the visible region. When the monitor geometry is
+/// unknown the placement is returned unchanged.
+fn detached_placement_with_visible_position(
+    placement: Option<DetachedWindowPlacement>,
+    main_rect: Option<egui::Rect>,
+    monitor_size: Option<Vec2>,
+) -> Option<DetachedWindowPlacement> {
+    let (Some(mut placement), Some(main_rect), Some(monitor_size)) =
+        (placement, main_rect, monitor_size)
+    else {
+        return placement;
+    };
+    if let Some(position) = placement.position {
+        let window_rect = egui::Rect::from_min_size(position, placement.inner_size);
+        let intersection = window_rect.intersect(monitor_visible_region(main_rect, monitor_size));
+        if intersection.width() < 100.0 || intersection.height() < 32.0 {
+            placement.position = None;
+        }
+    }
+    Some(placement)
+}
+
 fn detached_window_viewport_builder(
     kind: DetachedWindowKind,
     title: &'static str,
@@ -10041,6 +10080,28 @@ impl DawUi {
             app.recovery_prompt = Some(prompt);
         }
         app
+    }
+
+    /// The saved placement for a detached window, with its position checked
+    /// against the monitor that currently hosts the main window so a window
+    /// saved on a since-disconnected display does not open off-screen.
+    fn monitor_checked_detached_placement(
+        &self,
+        context: &egui::Context,
+        kind: DetachedWindowKind,
+    ) -> Option<DetachedWindowPlacement> {
+        let (main_rect, monitor_size) = context.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.outer_rect.or(viewport.inner_rect),
+                viewport.monitor_size,
+            )
+        });
+        detached_placement_with_visible_position(
+            self.detached_window_placements.get(kind),
+            main_rect,
+            monitor_size,
+        )
     }
 
     fn capture_detached_window_placement(
@@ -85379,8 +85440,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::PianoRoll,
                 "Piano roll",
                 Vec2::new(1120.0, 720.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::PianoRoll),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::PianoRoll),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85526,8 +85586,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Mixer,
                 "Mixer",
                 Vec2::new(1080.0, 640.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Mixer),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Mixer),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85657,8 +85716,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::ChannelRack,
                 "Channel Rack",
                 Vec2::new(980.0, 640.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::ChannelRack),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::ChannelRack),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85788,8 +85846,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Playlist,
                 "Playlist",
                 Vec2::new(1280.0, 760.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Playlist),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Playlist),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85919,8 +85976,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Plugins,
                 "Plug-ins",
                 Vec2::new(1000.0, 700.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Plugins),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Plugins),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85939,8 +85995,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Audio,
                 "Audio",
                 Vec2::new(900.0, 720.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Audio),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Audio),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85959,8 +86014,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Automation,
                 "Automation",
                 Vec2::new(1020.0, 700.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Automation),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Automation),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -100588,7 +100642,8 @@ mod tests {
         audio_recording_start_tick_with_offset, browser_audio_drop_tempo_sync,
         built_in_midi_controller_templates, candidate_live_mixer_send_key,
         candidate_matches_vst_identity, candidate_mixer_controls,
-        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        candidate_mixer_stereo_separation, detached_placement_with_visible_position,
+        detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
         internal_lfo_parameter_automation, internal_lfo_parameter_link_for_target,
@@ -105904,6 +105959,89 @@ mod tests {
         let encoded = serialize_window_layout_presets(std::slice::from_ref(&preset));
         let decoded = parse_window_layout_presets(&encoded);
         assert_eq!(decoded, vec![preset]);
+    }
+
+    #[test]
+    fn detached_placement_position_is_kept_when_the_window_is_reachable() {
+        // Main window 1200x800 at (100, 100) on a 1920x1080 monitor.
+        let main_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 100.0),
+            eframe::egui::vec2(1200.0, 800.0),
+        );
+        let monitor_size = eframe::egui::vec2(1920.0, 1080.0);
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(1500.0, 200.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        let checked = detached_placement_with_visible_position(
+            Some(placement),
+            Some(main_rect),
+            Some(monitor_size),
+        )
+        .expect("placement should survive the check");
+        assert_eq!(checked.position, placement.position);
+        assert_eq!(checked.inner_size, placement.inner_size);
+    }
+
+    #[test]
+    fn detached_placement_position_is_dropped_when_its_monitor_is_gone() {
+        let main_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 100.0),
+            eframe::egui::vec2(1200.0, 800.0),
+        );
+        let monitor_size = eframe::egui::vec2(1920.0, 1080.0);
+        // Saved on a second 1920-wide monitor to the right that has since
+        // been disconnected.
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(2100.0, 150.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        let checked = detached_placement_with_visible_position(
+            Some(placement),
+            Some(main_rect),
+            Some(monitor_size),
+        )
+        .expect("placement should survive the check");
+        assert_eq!(checked.position, None);
+        assert_eq!(checked.inner_size, placement.inner_size);
+    }
+
+    #[test]
+    fn detached_placement_position_is_dropped_when_only_a_sliver_is_visible() {
+        let main_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 100.0),
+            eframe::egui::vec2(1200.0, 800.0),
+        );
+        let monitor_size = eframe::egui::vec2(1920.0, 1080.0);
+        // The visible region ends at x = 1300 + (1920 - 1200) = 2020; a
+        // window starting at 1990 leaves only 30 points reachable.
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(1990.0, 150.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        let checked = detached_placement_with_visible_position(
+            Some(placement),
+            Some(main_rect),
+            Some(monitor_size),
+        )
+        .expect("placement should survive the check");
+        assert_eq!(checked.position, None);
+    }
+
+    #[test]
+    fn detached_placement_is_unchanged_without_monitor_geometry() {
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(4000.0, 150.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        assert_eq!(
+            detached_placement_with_visible_position(Some(placement), None, None),
+            Some(placement)
+        );
+        assert_eq!(
+            detached_placement_with_visible_position(None, None, None),
+            None
+        );
     }
 
     #[test]
