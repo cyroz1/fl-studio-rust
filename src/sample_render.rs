@@ -805,6 +805,11 @@ pub struct SamplerPatternRenderOptions {
     pub read_sample_root_note: bool,
     /// Use supported embedded source-tempo metadata when calculating Sampler time stretching.
     pub read_sample_tempo_information: bool,
+    /// Ignore the Max poly setting in Miscellaneous Channel Settings for this
+    /// render, as FL Studio's "Disable maximum polyphony" export option does
+    /// (fl-studio-online-manual/html/fformats_save_export.htm). The Mono
+    /// option is not ignored.
+    pub disable_maximum_polyphony: bool,
 }
 
 /// Timing and prepared plug-in stream for live Pattern-mode playback.
@@ -978,6 +983,7 @@ impl Default for SamplerPatternRenderOptions {
             resampling_quality: ResamplingQuality::RENDER_DEFAULT,
             read_sample_root_note: true,
             read_sample_tempo_information: true,
+            disable_maximum_polyphony: false,
         }
     }
 }
@@ -1555,6 +1561,11 @@ pub struct PlaylistRenderOptions {
     pub read_sample_root_note: bool,
     /// Use supported embedded source-tempo metadata when calculating Sampler and Audio Clip stretching.
     pub read_sample_tempo_information: bool,
+    /// Ignore the Max poly setting in Miscellaneous Channel Settings for this
+    /// render, as FL Studio's "Disable maximum polyphony" export option does
+    /// (fl-studio-online-manual/html/fformats_save_export.htm). The Mono
+    /// option is not ignored.
+    pub disable_maximum_polyphony: bool,
     /// App-local per-instance Audio Clip controls applied in live playback and renders.
     pub clip_envelopes: Arc<Vec<PlaylistAudioClipEnvelope>>,
     /// Pre-rendered CLAP instruments scheduled on the Playlist timeline.
@@ -2813,6 +2824,7 @@ impl Default for PlaylistRenderOptions {
             soloed_playlist_track_range: None,
             read_sample_root_note: true,
             read_sample_tempo_information: true,
+            disable_maximum_polyphony: false,
             clip_envelopes: Arc::new(Vec::new()),
             clap_audio_layers: Arc::new(Vec::new()),
             clap_audio_channel_ids: Arc::new(BTreeSet::new()),
@@ -16596,7 +16608,11 @@ fn prepare_sampler_arrangement(
                     options.sample_rate,
                     ppq,
                 ),
-                max_polyphony_raw: channel.sampler_max_polyphony_raw(),
+                max_polyphony_raw: if options.disable_maximum_polyphony {
+                    None
+                } else {
+                    channel.sampler_max_polyphony_raw()
+                },
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
                 polyphony_slide_raw: channel.sampler_polyphony_slide_raw(),
@@ -21253,7 +21269,11 @@ fn prepare_sampler_pattern_for_channel_internal(
                     options.sample_rate,
                     ppq,
                 ),
-                max_polyphony_raw: channel.sampler_max_polyphony_raw(),
+                max_polyphony_raw: if options.disable_maximum_polyphony {
+                    None
+                } else {
+                    channel.sampler_max_polyphony_raw()
+                },
                 mono_enabled: channel.sampler_mono_enabled().unwrap_or(false),
                 portamento_enabled: channel.sampler_portamento_enabled().unwrap_or(false),
                 polyphony_slide_raw: channel.sampler_polyphony_slide_raw(),
@@ -25854,6 +25874,125 @@ mod tests {
         );
     }
 
+    #[test]
+    fn disable_maximum_polyphony_render_option_ignores_the_max_poly_setting() {
+        // The manual's Export page: "Disable maximum polyphony - Ignores the
+        // Max poly setting in Miscellaneous Channel Settings but does NOT
+        // ignore Mono option if selected"
+        // (fl-studio-online-manual/html/fformats_save_export.htm). The fixture
+        // channel carries Max Polyphony 1 (0xDD event) with Mono off, and the
+        // pattern holds two overlapping notes, so the second note steals the
+        // first voice unless the option is set.
+        fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
+            assert!(payload.len() < 128);
+            event_stream.extend_from_slice(&[opcode, payload.len() as u8]);
+            event_stream.extend_from_slice(payload);
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "flp-rebuild-max-polyphony-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).expect("temporary test folder should be created");
+        let sample_path = root.join("poly.wav");
+        let mut file = File::create(&sample_path).expect("temporary WAV should be created");
+        // Two seconds of stereo PCM16 audio, so the first voice is still
+        // sounding when the second note starts.
+        let frames = 44_100_u32 * 2;
+        write_wav_header(
+            &mut file,
+            44_100,
+            frames,
+            frames * 4,
+            WavSampleFormat::Pcm16,
+            WavChannelMode::Stereo,
+        )
+        .unwrap();
+        let mut data = Vec::with_capacity((frames * 4) as usize);
+        for _ in 0..(frames * 2) {
+            data.extend_from_slice(&8_192_i16.to_le_bytes());
+        }
+        file.write_all(&data).unwrap();
+        drop(file);
+
+        let mut event_stream = Vec::new();
+        append_data_event(&mut event_stream, 0xC7, b"26.0.0\0");
+        event_stream.extend_from_slice(&[0x40, 7, 0, 0x15, 0]);
+        // Project strings are UTF-16LE in FL Studio 11.5+ projects.
+        let mut sample_path_payload = Vec::new();
+        for unit in "poly.wav".encode_utf16().chain(std::iter::once(0)) {
+            sample_path_payload.extend_from_slice(&unit.to_le_bytes());
+        }
+        append_data_event(&mut event_stream, 0xC4, &sample_path_payload);
+        let mut polyphony = Vec::new();
+        polyphony.extend_from_slice(&1_u32.to_le_bytes());
+        polyphony.extend_from_slice(&0_u32.to_le_bytes());
+        polyphony.push(0);
+        append_data_event(&mut event_stream, 0xDD, &polyphony);
+        event_stream.extend_from_slice(&[0x62, 0, 0]);
+        // Pattern 1 with two overlapping notes on channel 7, encoded as raw
+        // 24-byte score records (the layout PatternNote::decode reads).
+        event_stream.extend_from_slice(&[0x41, 1, 0]);
+        let mut note_records = Vec::new();
+        for position in [0_u32, 96] {
+            let mut record = [0_u8; 24];
+            record[0..4].copy_from_slice(&position.to_le_bytes());
+            record[4..6].copy_from_slice(&0x4000_u16.to_le_bytes());
+            record[6..8].copy_from_slice(&7_u16.to_le_bytes());
+            record[8..12].copy_from_slice(&384_u32.to_le_bytes());
+            record[12..14].copy_from_slice(&60_u16.to_le_bytes());
+            record[16] = 120;
+            record[18] = 64;
+            record[20] = 64;
+            record[21] = 100;
+            record[22] = 128;
+            record[23] = 128;
+            note_records.extend_from_slice(&record);
+        }
+        append_data_event(&mut event_stream, 0xE0, &note_records);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&6_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(&96_u16.to_le_bytes());
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(event_stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&event_stream);
+        let document = FlpDocument::parse(&bytes).expect("polyphony fixture should parse");
+        assert_eq!(document.channels()[0].sampler_max_polyphony_raw(), Some(1));
+        assert_eq!(document.channels()[0].sampler_mono_enabled(), Some(false));
+        let pattern_id = 1;
+
+        let project_path = root.join("project.flp");
+        let options = SamplerPatternRenderOptions {
+            pattern_id,
+            ..SamplerPatternRenderOptions::default()
+        };
+        let (_, limited) = render_sampler_pattern_to_stereo_buffer(
+            &document,
+            &project_path,
+            options,
+        )
+        .expect("limited render should succeed");
+        assert_eq!(limited.voices_stolen, 1);
+
+        let (_, unlimited) = render_sampler_pattern_to_stereo_buffer(
+            &document,
+            &project_path,
+            SamplerPatternRenderOptions {
+                disable_maximum_polyphony: true,
+                ..options
+            },
+        )
+        .expect("unlimited render should succeed");
+        assert_eq!(unlimited.voices_stolen, 0);
+
+        fs::remove_dir_all(root).expect("temporary test folder should be removed");
+    }
+
     fn performance_audio_clip_fixture(record_size: usize, scale: Option<f64>) -> FlpDocument {
         fn append_data_event(event_stream: &mut Vec<u8>, opcode: u8, payload: &[u8]) {
             assert!(payload.len() < 128);
@@ -28422,6 +28561,7 @@ mod tests {
                     soloed_playlist_track_range: None,
                     read_sample_root_note: true,
                     read_sample_tempo_information: true,
+                    disable_maximum_polyphony: false,
                     clip_envelopes: Arc::new(Vec::new()),
                     clap_audio_layers: Arc::new(Vec::new()),
                     clap_audio_channel_ids: Arc::new(BTreeSet::new()),

@@ -6344,6 +6344,7 @@ struct DawUi {
     playlist_render_channel_mode: WavChannelMode,
     playlist_render_tail_seconds: u8,
     playlist_render_tail_mode: PlaylistTailMode,
+    playlist_render_disable_maximum_polyphony: bool,
     playlist_render_include_plugin_tails: bool,
 }
 
@@ -9981,6 +9982,7 @@ impl DawUi {
             playlist_render_channel_mode: WavChannelMode::Stereo,
             playlist_render_tail_seconds: 0,
             playlist_render_tail_mode: PlaylistTailMode::LeaveRemainder,
+            playlist_render_disable_maximum_polyphony: false,
             playlist_render_include_plugin_tails: false,
         };
         if let Some((autosave_minutes, autosave_before_risky, backup_retention, backup_directory)) =
@@ -15538,6 +15540,11 @@ impl DawUi {
                             }
                         });
                 });
+                ui.checkbox(
+                    &mut self.playlist_render_disable_maximum_polyphony,
+                    "Disable maximum polyphony",
+                )
+                .on_hover_text("Ignores the Max poly setting in Miscellaneous Channel Settings for this render. The Mono option is not ignored.");
                 if self.playlist_render_mixer_stems {
                     ui.label("Mixer stems use the selected base tail; reported instrument and effect tails can extend the render.");
                 } else if self.playlist_render_tail_mode == PlaylistTailMode::LeaveRemainder {
@@ -59438,6 +59445,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         let linked_automation_sources = self.vst3_playlist_automation_sources(&render_document);
@@ -60234,6 +60242,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
@@ -60414,6 +60423,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         if render_range.is_some() {
@@ -60524,6 +60534,7 @@ impl DawUi {
             wav_channel_mode: self.playlist_render_channel_mode,
             tail_seconds: self.playlist_render_tail_seconds,
             tail_mode: self.playlist_render_tail_mode,
+            disable_maximum_polyphony: self.playlist_render_disable_maximum_polyphony,
             ..PlaylistRenderOptions::default()
         };
         let playlist_parameter_automation = self.vst3_playlist_automation_sources(document);
