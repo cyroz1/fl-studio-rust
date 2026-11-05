@@ -14739,18 +14739,18 @@ fn delete_time_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        delete_note, delete_notes_with_scope, parse_automation_interpolation_mode,
-        parse_clip_indices, parse_midi_channel_filter, parse_midi_channel_mask,
-        parse_midi_channel_number, parse_midi_import_options,
+        add_note, add_notes, delete_note, delete_notes_with_scope,
+        parse_automation_interpolation_mode, parse_clip_indices, parse_midi_channel_filter,
+        parse_midi_channel_mask, parse_midi_channel_number, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
         parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_eq_parameter_kind,
-        parse_mixer_track, parse_note_indices, parse_raw_byte, parse_rgb_hex,
+        parse_mixer_track, parse_note_indices, parse_note_specs, parse_raw_byte, parse_rgb_hex,
         parse_sampler_envelope_lfo_target, parse_scale_name, pattern_color_label,
         playlist_pattern_color_label,
     };
     use flp_rebuild::{
-        AutomationInterpolationMode, FlpDocument, MixerParameterKind, SamplerEnvelopeLfoTarget,
-        midi::MidiImportOptions,
+        AutomationInterpolationMode, FlpDocument, MixerParameterKind, PATTERN_NOTE_DEFAULT_FLAGS,
+        PatternNote, SamplerEnvelopeLfoTarget, midi::MidiImportOptions,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -15318,6 +15318,179 @@ mod tests {
         .expect("fixture should be written");
 
         assert!(delete_note(&input, &output, 7, 0, 1).is_err());
+        assert!(!output.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_note_specs_with_neutral_defaults() {
+        let notes =
+            parse_note_specs(3, "0:48:60:100,96:24:64:80").expect("note specs should parse");
+        assert_eq!(
+            notes,
+            [
+                PatternNote {
+                    channel_id: 3,
+                    position: 0,
+                    length: 48,
+                    key: 60,
+                    velocity: 100,
+                    ..PatternNote::default()
+                },
+                PatternNote {
+                    channel_id: 3,
+                    position: 96,
+                    length: 24,
+                    key: 64,
+                    velocity: 80,
+                    ..PatternNote::default()
+                },
+            ]
+        );
+        for note in &notes {
+            assert_eq!(note.flags, PATTERN_NOTE_DEFAULT_FLAGS);
+            assert_eq!(note.fine_pitch, 120);
+            assert_eq!(note.release, 64);
+            assert_eq!(note.pan, 64);
+            assert_eq!(note.mod_x, 128);
+            assert_eq!(note.mod_y, 128);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_note_specs() {
+        assert!(parse_note_specs(0, "").is_err());
+        assert!(parse_note_specs(0, "0:48:60").is_err());
+        assert!(parse_note_specs(0, "0:48:60:100:5").is_err());
+        assert!(parse_note_specs(0, "0:48:60:100,").is_err());
+        assert!(parse_note_specs(0, "x:48:60:100").is_err());
+        assert!(parse_note_specs(0, "0:48:60:256").is_err());
+    }
+
+    #[test]
+    fn parses_note_indices_and_rejects_malformed_lists() {
+        assert_eq!(parse_note_indices("0,2,5"), Ok(vec![0, 2, 5]));
+        assert_eq!(parse_note_indices(" 3 , 4 "), Ok(vec![3, 4]));
+        assert!(parse_note_indices("").is_err());
+        assert!(parse_note_indices("1,,2").is_err());
+        assert!(parse_note_indices("a").is_err());
+        assert!(parse_note_indices("-1").is_err());
+    }
+
+    #[test]
+    fn cli_add_note_appends_one_note_with_neutral_defaults() {
+        let dir = cli_test_dir("add-note");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[cli_note_record(0, 0, 48, 60, 100)]),
+        )
+        .expect("fixture should be written");
+
+        add_note(
+            &input,
+            &output,
+            7,
+            PatternNote {
+                channel_id: 0,
+                position: 120,
+                length: 24,
+                key: 64,
+                velocity: 90,
+                ..PatternNote::default()
+            },
+        )
+        .expect("add-note should succeed");
+
+        let document = read_cli_output(&output);
+        let notes = &document.patterns().unwrap()[0].notes;
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[1],
+            PatternNote {
+                channel_id: 0,
+                position: 120,
+                length: 24,
+                key: 64,
+                velocity: 90,
+                ..PatternNote::default()
+            }
+        );
+        assert_eq!(notes[1].flags, PATTERN_NOTE_DEFAULT_FLAGS);
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+        // The written file must survive a lossless re-encode unchanged.
+        assert_eq!(
+            document.encode_lossless().expect("output should encode"),
+            fs::read(&output).expect("output should be readable")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_add_notes_appends_multiple_notes_in_order() {
+        let dir = cli_test_dir("add-notes");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[
+                cli_note_record(0, 0, 48, 60, 100),
+                cli_note_record(12, 1, 24, 48, 80),
+            ]),
+        )
+        .expect("fixture should be written");
+
+        let notes =
+            parse_note_specs(0, "96:24:64:90,48:12:67:80").expect("note specs should parse");
+        add_notes(&input, &output, 7, &notes).expect("add-notes should succeed");
+
+        let document = read_cli_output(&output);
+        let written = &document.patterns().unwrap()[0].notes;
+        assert_eq!(written.len(), 4);
+        assert_eq!(written[2], notes[0]);
+        assert_eq!(written[3], notes[1]);
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+        assert_eq!(
+            document.encode_lossless().expect("output should encode"),
+            fs::read(&output).expect("output should be readable")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_add_note_to_a_missing_pattern_errors_and_writes_nothing() {
+        let dir = cli_test_dir("add-note-missing");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[cli_note_record(0, 0, 48, 60, 100)]),
+        )
+        .expect("fixture should be written");
+
+        assert!(
+            add_note(
+                &input,
+                &output,
+                99,
+                PatternNote {
+                    channel_id: 0,
+                    position: 0,
+                    length: 24,
+                    key: 64,
+                    velocity: 90,
+                    ..PatternNote::default()
+                },
+            )
+            .is_err()
+        );
         assert!(!output.exists());
         let _ = fs::remove_dir_all(&dir);
     }

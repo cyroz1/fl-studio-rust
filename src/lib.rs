@@ -30660,14 +30660,15 @@ mod tests {
         MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
         MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
-        PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG, PatternController,
-        PatternControllerEdit, PatternNote, PatternNoteEdit, PatternNoteRotation, PayloadEncoding,
-        PlaylistClipEdit, PlaylistClipTarget, PlaylistTrackEdit, PlaylistTrackMotion,
-        PlaylistTrackPress, PlaylistTrackSync, ProjectInfoEdit, ProjectSettingsEdit,
-        RandomizerOptions, RiffMachineOptions, RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit,
-        SamplerEnvelopeLfoTarget, SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit,
-        apply_mixer_pan, apply_mixer_stereo_separation, midi::MidiChannelMapping,
-        midi::MidiEventKind, midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
+        PATTERN_NOTE_DEFAULT_RELEASE, PATTERN_NOTE_SLIDE_FLAG, PLAYLIST_CLIP_MUTED_FLAG,
+        PatternController, PatternControllerEdit, PatternNote, PatternNoteEdit,
+        PatternNoteRotation, PayloadEncoding, PlaylistClipEdit, PlaylistClipTarget,
+        PlaylistTrackEdit, PlaylistTrackMotion, PlaylistTrackPress, PlaylistTrackSync,
+        ProjectInfoEdit, ProjectSettingsEdit, RandomizerOptions, RiffMachineOptions,
+        RiffMachineQuantizeMode, SamplerEnvelopeLfoEdit, SamplerEnvelopeLfoTarget,
+        SamplerVolumeEnvelopeEdit, ScaleLevelsOptions, TimeMarkerEdit, apply_mixer_pan,
+        apply_mixer_stereo_separation, midi::MidiChannelMapping, midi::MidiEventKind,
+        midi::MidiFile, midi::MidiImportOptions, note_pitch_in_scale,
         parse_vst_plugin_state_metadata, parse_vst3_output_mixer_offset_records,
         riff_machine_groove_note_timing,
     };
@@ -43381,6 +43382,144 @@ mod tests {
         assert_eq!(empty_pattern.notes[0].key, 65);
         let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
         assert_eq!(reparsed.patterns().unwrap()[1].notes.len(), 1);
+    }
+
+    #[test]
+    fn adding_a_batch_of_notes_appends_in_order_and_round_trips() {
+        let original_note = note_record(0, 0, 48, 60, 100);
+        let unknown_event = [0xFF, 0x02, 0xAA, 0xBB];
+        let input = pattern_fixture(&[original_note], &unknown_event);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let batch = [
+            PatternNote {
+                position: 96,
+                channel_id: 0,
+                length: 24,
+                key: 64,
+                velocity: 90,
+                ..PatternNote::default()
+            },
+            PatternNote {
+                position: 48,
+                channel_id: 0,
+                length: 12,
+                key: 67,
+                velocity: 80,
+                ..PatternNote::default()
+            },
+        ];
+        document
+            .add_pattern_notes(7, &batch)
+            .expect("the batch should be appended");
+
+        let patterns = document.patterns().expect("patterns should decode");
+        assert_eq!(patterns[0].notes.len(), 3);
+        assert_eq!(patterns[0].notes[1], batch[0]);
+        assert_eq!(patterns[0].notes[2], batch[1]);
+        for note in &patterns[0].notes[1..] {
+            assert_eq!(note.flags, PATTERN_NOTE_DEFAULT_FLAGS);
+            assert_eq!(note.fine_pitch, 120);
+            assert_eq!(note.release, PATTERN_NOTE_DEFAULT_RELEASE);
+            assert_eq!(note.pan, 64);
+            assert_eq!(note.mod_x, 128);
+            assert_eq!(note.mod_y, 128);
+        }
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &unknown_event
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        assert_eq!(reparsed.patterns().unwrap()[0].notes, patterns[0].notes);
+    }
+
+    #[test]
+    fn adding_a_batch_to_an_empty_pattern_uses_the_projects_observed_note_encoding() {
+        let existing_note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&existing_note);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xA4, 0, 0, 0, 0]);
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        let batch = [
+            PatternNote {
+                position: 24,
+                channel_id: 0,
+                length: 24,
+                key: 65,
+                velocity: 90,
+                ..PatternNote::default()
+            },
+            PatternNote {
+                position: 48,
+                channel_id: 0,
+                length: 24,
+                key: 69,
+                velocity: 85,
+                ..PatternNote::default()
+            },
+        ];
+        document
+            .add_pattern_notes(8, &batch)
+            .expect("the empty pattern should use the observed D0 encoding");
+
+        let patterns = document.patterns().unwrap();
+        let added = patterns
+            .iter()
+            .find(|pattern| pattern.id == 8)
+            .expect("pattern 8 should remain");
+        assert_eq!(added.notes, batch);
+        let reparsed = FlpDocument::parse(&document.encode_lossless().unwrap()).unwrap();
+        let reparsed_added = reparsed
+            .patterns()
+            .unwrap()
+            .into_iter()
+            .find(|pattern| pattern.id == 8)
+            .unwrap();
+        assert_eq!(reparsed_added.notes, batch);
+    }
+
+    #[test]
+    fn adding_an_empty_batch_of_notes_changes_nothing() {
+        let input = pattern_fixture(&[note_record(0, 0, 48, 60, 100)], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        document
+            .add_pattern_notes(7, &[])
+            .expect("an empty batch should be accepted");
+        document
+            .add_pattern_notes(99, &[])
+            .expect("an empty batch should be accepted for any pattern");
+        assert_eq!(document.encode_lossless().unwrap(), input);
+    }
+
+    #[test]
+    fn adding_notes_to_a_missing_pattern_or_channel_errors_without_mutation() {
+        let input = pattern_fixture(&[note_record(0, 0, 48, 60, 100)], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.encode_lossless().unwrap();
+        let note = PatternNote {
+            position: 24,
+            channel_id: 0,
+            length: 24,
+            key: 64,
+            velocity: 90,
+            ..PatternNote::default()
+        };
+
+        assert!(document.add_pattern_notes(99, &[note.clone()]).is_err());
+        let missing_channel = PatternNote {
+            channel_id: 9,
+            ..note.clone()
+        };
+        assert!(document.add_pattern_notes(7, &[missing_channel]).is_err());
+        assert!(document.add_pattern_note(99, note).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
     }
 
     #[test]
