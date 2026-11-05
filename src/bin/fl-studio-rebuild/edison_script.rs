@@ -100,10 +100,7 @@ pub fn grouped_edison_scripts(
 ) -> Vec<(Option<String>, Vec<EdisonScript>)> {
     let mut groups: Vec<(Option<String>, Vec<EdisonScript>)> = Vec::new();
     for script in scripts {
-        if let Some(existing) = groups
-            .iter_mut()
-            .find(|(group, _)| *group == script.group)
-        {
+        if let Some(existing) = groups.iter_mut().find(|(group, _)| *group == script.group) {
             existing.1.push(script.clone());
         } else {
             groups.push((script.group.clone(), vec![script.clone()]));
@@ -485,9 +482,8 @@ pub fn run_edison_script(
             let num_chans = result["num_chans"].as_u64().unwrap_or(0) as usize;
             let length = result["length"].as_u64().unwrap_or(0) as usize;
             let sample_rate = result["sample_rate"].as_u64().unwrap_or(0) as u32;
-            let raw = fs::read(&out_sample_path).map_err(|error| {
-                format!("could not read the script's output sample: {error}")
-            })?;
+            let raw = fs::read(&out_sample_path)
+                .map_err(|error| format!("could not read the script's output sample: {error}"))?;
             if raw.len() != 4 * num_chans * length {
                 return Ok(EdisonScriptRunOutcome::Failed {
                     error: format!(
@@ -561,10 +557,7 @@ fn parse_edison_dialog_spec(value: &Value) -> EdisonScriptDialogSpec {
         .unwrap_or_default();
     EdisonScriptDialogSpec {
         title: value["title"].as_str().unwrap_or_default().to_owned(),
-        description: value["description"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned(),
+        description: value["description"].as_str().unwrap_or_default().to_owned(),
         inputs,
     }
 }
@@ -640,9 +633,7 @@ mod tests {
             directories,
             [
                 PathBuf::from("/app-data/Settings/Audio scripts"),
-                PathBuf::from(
-                    "/home/test/Documents/Image-Line/FL Studio/Settings/Audio scripts"
-                ),
+                PathBuf::from("/home/test/Documents/Image-Line/FL Studio/Settings/Audio scripts"),
             ]
         );
         assert!(edison_script_directories(None, None).is_empty());
@@ -656,10 +647,8 @@ mod tests {
         fs::write(second.path().join("Amp.pyscript"), "second").unwrap();
         fs::write(second.path().join("Blur.pyscript"), "second").unwrap();
 
-        let scripts = discover_all_edison_scripts(&[
-            first.path().to_path_buf(),
-            second.path().to_path_buf(),
-        ]);
+        let scripts =
+            discover_all_edison_scripts(&[first.path().to_path_buf(), second.path().to_path_buf()]);
 
         assert_eq!(scripts.len(), 2);
         assert_eq!(scripts[0].name, "Amp");
@@ -717,10 +706,7 @@ mod engine_tests {
     fn stereo_sample() -> EdisonScriptSample {
         EdisonScriptSample {
             sample_rate: 8_000,
-            channels: vec![
-                vec![0.1, 0.2, 0.3, 0.4],
-                vec![-0.1, -0.2, -0.3, -0.4],
-            ],
+            channels: vec![vec![0.1, 0.2, 0.3, 0.4], vec![-0.1, -0.2, -0.3, -0.4]],
         }
     }
 
@@ -807,9 +793,8 @@ mod engine_tests {
 
         // Phase 1 discarded its (non-)edits; phase 2 applies the gain.
         let values = BTreeMap::from([("Gain".to_owned(), 3.0), ("Mode".to_owned(), 0.0)]);
-        let (sample, _, _) = completed(
-            run_edison_script(&script, &stereo_sample(), 0, 4, Some(&values)).unwrap(),
-        );
+        let (sample, _, _) =
+            completed(run_edison_script(&script, &stereo_sample(), 0, 4, Some(&values)).unwrap());
         assert_eq!(sample.channels[0][0], 0.3);
         assert_eq!(sample.channels[0][1], 0.6);
         assert!((sample.channels[0][2] - 0.9).abs() < 0.0001);
