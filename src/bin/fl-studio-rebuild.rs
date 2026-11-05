@@ -32,7 +32,7 @@ use flp_rebuild::audio::{
 };
 use flp_rebuild::media::{
     AudioExportOptions, AudioWaveform, BrowserPreviewPitch, DecodedAudio, SampleKeyMetadata,
-    SamplePathResolver, WaveformPeak, decode_audio_file, decode_audio_preview,
+    SamplePathResolver, SpectralBandGain, WaveformPeak, decode_audio_file, decode_audio_preview,
     decode_audio_waveform, decode_browser_preview, find_empty_project_template,
     process_audio_range_to_stereo_preview, sample_key_metadata, summarize_audio_waveform,
     wave_acid_loop_tempo_metadata, write_audio_range_to_wav_with_options,
@@ -502,6 +502,18 @@ fn install_ui_visuals(context: &egui::Context) {
         style.spacing.menu_margin = egui::Margin::same(8);
         style.spacing.slider_rail_height = 4.0;
     });
+}
+
+/// Minimum control sizes used when touch-sized controls are enabled, so
+/// buttons, checkboxes, and sliders stay easy to hit on a touch screen.
+/// Idempotent: applying it to an already touch-sized style changes nothing.
+fn apply_touch_controls_spacing(style: &mut egui::Style) {
+    let spacing = &mut style.spacing;
+    spacing.interact_size.x = spacing.interact_size.x.max(44.0);
+    spacing.interact_size.y = spacing.interact_size.y.max(40.0);
+    spacing.button_padding.x = spacing.button_padding.x.max(12.0);
+    spacing.button_padding.y = spacing.button_padding.y.max(10.0);
+    spacing.slider_rail_height = spacing.slider_rail_height.max(8.0);
 }
 
 fn apply_local_ui_scale(ui: &mut egui::Ui, scale: f32) {
@@ -2095,6 +2107,45 @@ impl WindowLayoutPreset {
                     .is_none_or(|placement| placement.is_valid(kind))
             })
     }
+}
+
+/// The region a window can plausibly occupy given the monitor hosting the
+/// main window. egui reports only that monitor's size, and the monitor's
+/// rect must contain the main window's outer rect, so the union of candidate
+/// monitor rects is the main rect expanded by the size difference per side.
+fn monitor_visible_region(main_rect: egui::Rect, monitor_size: Vec2) -> egui::Rect {
+    let slack = egui::vec2(
+        (monitor_size.x - main_rect.width()).max(0.0),
+        (monitor_size.y - main_rect.height()).max(0.0),
+    );
+    egui::Rect::from_min_max(main_rect.min - slack, main_rect.max + slack)
+}
+
+/// Drop a saved detached-window position that can no longer be on a
+/// connected monitor (for example after a display is unplugged), keeping the
+/// saved size. Without a position the window manager places the window
+/// visibly, and the placement capture then records where it landed. A
+/// position is kept when at least a grabbable part of the window (100x32
+/// points) intersects the visible region. When the monitor geometry is
+/// unknown the placement is returned unchanged.
+fn detached_placement_with_visible_position(
+    placement: Option<DetachedWindowPlacement>,
+    main_rect: Option<egui::Rect>,
+    monitor_size: Option<Vec2>,
+) -> Option<DetachedWindowPlacement> {
+    let (Some(mut placement), Some(main_rect), Some(monitor_size)) =
+        (placement, main_rect, monitor_size)
+    else {
+        return placement;
+    };
+    if let Some(position) = placement.position {
+        let window_rect = egui::Rect::from_min_size(position, placement.inner_size);
+        let intersection = window_rect.intersect(monitor_visible_region(main_rect, monitor_size));
+        if intersection.width() < 100.0 || intersection.height() < 32.0 {
+            placement.position = None;
+        }
+    }
+    Some(placement)
 }
 
 fn detached_window_viewport_builder(
@@ -4989,6 +5040,18 @@ impl BrowserTab {
             Self::Recent => "Recent",
         }
     }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Files => "Browser: files on disk",
+            Self::CurrentProject => {
+                "Browser: the current project's channels, Patterns, and plug-in states"
+            }
+            Self::Plugins => "Browser: installed plug-ins",
+            Self::Favorites => "Browser: favorite files and folders",
+            Self::Recent => "Browser: recent projects",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5454,6 +5517,31 @@ struct SampleEditorState {
     normalize_export: bool,
     normalization_target_dbfs: f32,
     reverse_export: bool,
+    spectral_band_enabled: bool,
+    spectral_band_low_hz: f32,
+    spectral_band_high_hz: f32,
+    spectral_band_gain_db: f32,
+}
+
+impl SampleEditorState {
+    /// The spectral band edit to include in preview/export processing, if the
+    /// user enabled it and the band is usable at this sample rate.
+    fn spectral_band_gain(&self) -> Option<SpectralBandGain> {
+        if !self.spectral_band_enabled {
+            return None;
+        }
+        let nyquist = self.audio.sample_rate as f32 / 2.0;
+        let low_hz = self.spectral_band_low_hz.clamp(20.0, nyquist);
+        let high_hz = self.spectral_band_high_hz.clamp(low_hz * 1.01, nyquist);
+        if high_hz <= low_hz || !(20.0..=nyquist).contains(&low_hz) {
+            return None;
+        }
+        Some(SpectralBandGain {
+            low_hz,
+            high_hz,
+            gain_db: self.spectral_band_gain_db,
+        })
+    }
 }
 
 struct PendingBackupWrite {
@@ -6052,6 +6140,9 @@ struct DawUi {
     soloed_playlist_track_range: Option<(u32, u32)>,
     collapsed_playlist_groups: BTreeSet<(u16, u32)>,
     hide_collapsed_playlist_groups: bool,
+    touch_controls: bool,
+    touch_controls_style_applied: bool,
+    hover_hint: Option<String>,
     playlist_zero_crossing_splits: bool,
     playlist_edit_patterns_in: PlaylistEditPatternsIn,
     playlist_clip_focus: PlaylistClipFocus,
@@ -9333,6 +9424,7 @@ impl DawUi {
         let piano_roll_note_grouping_enabled = load_piano_roll_note_grouping_enabled();
         let channel_rack_mute_removed_steps = load_channel_rack_mute_removed_steps();
         let hide_collapsed_playlist_groups = load_hide_collapsed_playlist_groups();
+        let touch_controls = load_touch_controls();
         let playlist_zero_crossing_splits = load_playlist_zero_crossing_splits();
         let playlist_show_fade_gain_previews = load_playlist_show_fade_gain_previews();
         let playlist_pattern_color_mode = load_playlist_pattern_color_mode();
@@ -9692,6 +9784,9 @@ impl DawUi {
             soloed_playlist_track_range: None,
             collapsed_playlist_groups: BTreeSet::new(),
             hide_collapsed_playlist_groups,
+            touch_controls,
+            touch_controls_style_applied: false,
+            hover_hint: None,
             playlist_edit_patterns_in,
             playlist_clip_focus: PlaylistClipFocus::default(),
             playlist_pattern_color_mode,
@@ -10089,6 +10184,37 @@ impl DawUi {
             app.recovery_prompt = Some(prompt);
         }
         app
+    }
+
+    /// Record the hint for the control currently under the pointer. The
+    /// status bar acts as the hint bar: it shows this text for the frame and
+    /// falls back to the status message when nothing is hovered.
+    fn note_hover_hint(&mut self, response: &egui::Response, hint: &str) {
+        if response.hovered() {
+            self.hover_hint = Some(hint.to_owned());
+        }
+    }
+
+    /// The saved placement for a detached window, with its position checked
+    /// against the monitor that currently hosts the main window so a window
+    /// saved on a since-disconnected display does not open off-screen.
+    fn monitor_checked_detached_placement(
+        &self,
+        context: &egui::Context,
+        kind: DetachedWindowKind,
+    ) -> Option<DetachedWindowPlacement> {
+        let (main_rect, monitor_size) = context.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.outer_rect.or(viewport.inner_rect),
+                viewport.monitor_size,
+            )
+        });
+        detached_placement_with_visible_position(
+            self.detached_window_placements.get(kind),
+            main_rect,
+            monitor_size,
+        )
     }
 
     fn capture_detached_window_placement(
@@ -20628,6 +20754,39 @@ impl DawUi {
                     self.merge_selected_playlist_pattern_clips();
                     ui.close();
                 }
+                ui.separator();
+                let can_select_playlist_clips =
+                    self.view == MainView::Playlist && self.document.is_some();
+                if ui
+                    .add_enabled(
+                        can_select_playlist_clips,
+                        egui::Button::new("Select all Playlist clips  Ctrl/Cmd+A"),
+                    )
+                    .clicked()
+                {
+                    self.select_all_playlist_clips();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        can_select_playlist_clips,
+                        egui::Button::new("Invert Playlist clip selection  Shift+I"),
+                    )
+                    .clicked()
+                {
+                    self.invert_playlist_clip_selection();
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(
+                        can_select_playlist_clips,
+                        egui::Button::new("Deselect Playlist clips  Ctrl/Cmd+D"),
+                    )
+                    .clicked()
+                {
+                    self.deselect_playlist_clips();
+                    ui.close();
+                }
             });
             ui.menu_button("Add", |ui| {
                 if ui
@@ -21010,6 +21169,17 @@ impl DawUi {
                         }
                     }
                 });
+                ui.separator();
+                if ui
+                    .checkbox(&mut self.touch_controls, "Touch-sized controls")
+                    .on_hover_text(
+                        "Larger buttons, checkboxes, and sliders for touch screens",
+                    )
+                    .changed()
+                    && let Err(error) = save_touch_controls(self.touch_controls)
+                {
+                    self.status = format!("Could not save touch controls setting: {error}");
+                }
             });
             ui.menu_button("Tools", |ui| {
                 if ui.button("Channel Rack Graph Editor").clicked() {
@@ -21141,7 +21311,39 @@ impl DawUi {
                         .map(|name| name.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Untitled".to_owned())
                 };
-                ui.label(format!("{}{}", title, if self.dirty { " *" } else { "" }));
+                // Project picker: click the project name to open another
+                // project or switch to a recent one without the File menu.
+                let picker_label = format!("{}{}", title, if self.dirty { " *" } else { "" });
+                ui.menu_button(picker_label, |ui| {
+                    if ui.button("Open…").clicked() {
+                        self.open_dialog();
+                        ui.close();
+                    }
+                    ui.separator();
+                    let recent_projects = self.browser_recent_projects.clone();
+                    if recent_projects.is_empty() {
+                        ui.label("No recent projects");
+                    }
+                    let mut open_path = None;
+                    for path in recent_projects.iter().take(10) {
+                        let name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
+                        let is_current = self.current_path.as_deref() == Some(path.as_path());
+                        if ui
+                            .add_enabled(!is_current, egui::Button::new(name))
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            open_path = Some(path.clone());
+                        }
+                    }
+                    if let Some(path) = open_path {
+                        ui.close();
+                        self.open_project(&path);
+                    }
+                });
             });
         });
     }
@@ -24657,38 +24859,38 @@ impl DawUi {
             )
             .fill(if recording { RED } else { PANEL })
             .stroke(Stroke::NONE);
-            let record_response =
-                ui.add(record_button)
-                    .on_hover_text(if recording_precount {
-                        "Cancel recording count-in"
-                    } else if recording_audio && recording_midi {
-                        "Finish audio and MIDI note recording"
-                    } else if recording_audio {
-                        "Finish audio recording"
-                    } else if recording_midi
-                        && self
-                            .midi_recording
-                            .as_ref()
-                            .is_some_and(|recording| recording.automation.is_some())
-                    {
-                        if self
-                            .midi_recording
-                            .as_ref()
-                            .is_some_and(|recording| recording.record_notes)
-                        {
-                            "Finish MIDI notes and MIDI automation recording"
-                        } else {
-                            "Finish MIDI automation recording"
-                        }
-                    } else if recording_midi {
-                        "Finish MIDI note recording"
-                    } else if audio_recording_finalizing {
-                        "Finalizing the recorded audio take"
-                    } else if can_record {
-                        "Record the selected audio and MIDI input types"
-                    } else {
-                        "Enable a recording filter and connect its input first"
-                    });
+            let record_hint: &str = if recording_precount {
+                "Cancel recording count-in"
+            } else if recording_audio && recording_midi {
+                "Finish audio and MIDI note recording"
+            } else if recording_audio {
+                "Finish audio recording"
+            } else if recording_midi
+                && self
+                    .midi_recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.automation.is_some())
+            {
+                if self
+                    .midi_recording
+                    .as_ref()
+                    .is_some_and(|recording| recording.record_notes)
+                {
+                    "Finish MIDI notes and MIDI automation recording"
+                } else {
+                    "Finish MIDI automation recording"
+                }
+            } else if recording_midi {
+                "Finish MIDI note recording"
+            } else if audio_recording_finalizing {
+                "Finalizing the recorded audio take"
+            } else if can_record {
+                "Record the selected audio and MIDI input types"
+            } else {
+                "Enable a recording filter and connect its input first"
+            };
+            let record_response = ui.add(record_button).on_hover_text(record_hint);
+            self.note_hover_hint(&record_response, record_hint);
             let mut record_filters_changed = false;
             let _ = record_response.context_menu(|ui| {
                 apply_local_ui_scale(ui, self.popup_menu_scale);
@@ -24849,7 +25051,9 @@ impl DawUi {
                     }
                 }
             }
-            if ui.button("■").on_hover_text("Stop").clicked() {
+            let stop_response = ui.button("■").on_hover_text("Stop");
+            self.note_hover_hint(&stop_response, "Stop");
+            if stop_response.clicked() {
                 let was_preparing = self.pending_audio_render.is_some()
                     || self.playlist_render_is_pending()
                     || self.pending_clap_pattern_playback.is_some()
@@ -24867,20 +25071,21 @@ impl DawUi {
                     "Project playback stopped".to_owned()
                 };
             }
-            if ui
+            let pattern_mode_hint = "Pattern mode (L): play the selected Pattern";
+            let pattern_mode_response = ui
                 .selectable_label(self.pattern_playback_mode, "PAT")
                 .on_hover_text(
                     "L: play the selected Pattern through enabled Sampler and loaded VST3 channels, plus any CLAP Pattern transport assignments. CLAP loops use project base tempo and mix directly to Master; Playlist Audio Clips and their tempo automation are not included.",
-                )
-                .clicked()
-            {
+                );
+            self.note_hover_hint(&pattern_mode_response, pattern_mode_hint);
+            if pattern_mode_response.clicked() {
                 self.set_pattern_playback_mode(true);
             }
-            if ui
+            let song_mode_response = ui
                 .selectable_label(!self.pattern_playback_mode, "SONG")
-                .on_hover_text("L: play the Playlist arrangement")
-                .clicked()
-            {
+                .on_hover_text("L: play the Playlist arrangement");
+            self.note_hover_hint(&song_mode_response, "Song mode (L): play the Playlist arrangement");
+            if song_mode_response.clicked() {
                 self.set_pattern_playback_mode(false);
             }
             let metronome_response = ui
@@ -24888,6 +25093,10 @@ impl DawUi {
                 .on_hover_text(
                     "Metronome: click each beat and accent each bar (Ctrl/Cmd+M; right-click for samples and Mixer route, also used by PRE)",
                 );
+            self.note_hover_hint(
+                &metronome_response,
+                "Metronome (Ctrl/Cmd+M; right-click for samples and Mixer route)",
+            );
             let metronome_mixer_tracks = self.document.as_ref().map_or_else(
                 || vec![(0_i8, "Master".to_owned())],
                 |document| {
@@ -24985,6 +25194,10 @@ impl DawUi {
                 .on_hover_text(
                     "Recording count-in: play clicks through the MET Mixer route before a stopped recording (Ctrl/Cmd+P; right-click for bar count)",
                 );
+            self.note_hover_hint(
+                &precount_response,
+                "Recording count-in (Ctrl/Cmd+P; right-click for bar count)",
+            );
             let _ = precount_response.context_menu(|ui| {
                 apply_local_ui_scale(ui, self.popup_menu_scale);
                 let mut enabled = self.recording_precount_enabled;
@@ -25030,24 +25243,24 @@ impl DawUi {
                 "Play"
             };
             let play_fill = if self.playing { GREEN } else { BLUE };
-            if ui
+            let play_response = ui
                 .add(
                     egui::Button::new(egui::RichText::new(play_label).color(Color32::WHITE))
                         .fill(play_fill)
                         .stroke(Stroke::NONE),
                 )
-                .on_hover_text(play_hint)
-                .clicked()
-            {
+                .on_hover_text(play_hint);
+            self.note_hover_hint(&play_response, play_hint);
+            if play_response.clicked() {
                 self.toggle_project_playback();
             }
             ui.separator();
             ui.label("Tempo");
             let mut bpm = self.tempo_bpm;
-            if ui
-                .add(egui::DragValue::new(&mut bpm).speed(0.1).suffix(" BPM"))
-                .changed()
-            {
+            let tempo_response =
+                ui.add(egui::DragValue::new(&mut bpm).speed(0.1).suffix(" BPM"));
+            self.note_hover_hint(&tempo_response, "Song tempo");
+            if tempo_response.changed() {
                 self.tempo_bpm = bpm;
                 self.update_tempo(bpm);
             }
@@ -25067,7 +25280,7 @@ impl DawUi {
                             .map_or_else(|| format!("Pattern {}", pattern.id), str::to_owned)
                     })
                     .unwrap_or_else(|| "No patterns".to_owned());
-                egui::ComboBox::from_id_salt("transport-pattern-picker")
+                let pattern_picker_response = egui::ComboBox::from_id_salt("transport-pattern-picker")
                     .selected_text(selected_pattern_text)
                     .width(132.0 * scale)
                     .show_ui(ui, |ui| {
@@ -25090,6 +25303,10 @@ impl DawUi {
                             });
                         }
                     });
+                self.note_hover_hint(
+                    &pattern_picker_response.response,
+                    "Pattern picker: choose the Pattern to edit and audition in PAT mode",
+                );
                 if ui
                     .small_button("+")
                     .on_hover_text("Create a new pattern")
@@ -30949,7 +31166,9 @@ impl DawUi {
             for tab in BrowserTab::ALL {
                 let selected =
                     self.browser_tab == tab && self.browser_active_saved_search.is_none();
-                if ui.selectable_label(selected, tab.label()).clicked() {
+                let tab_response = ui.selectable_label(selected, tab.label());
+                self.note_hover_hint(&tab_response, tab.hint());
+                if tab_response.clicked() {
                     self.browser_tab = tab;
                     self.browser_active_saved_search = None;
                 }
@@ -31428,6 +31647,7 @@ impl DawUi {
             normalization_target_dbfs: editor
                 .normalize_export
                 .then_some(editor.normalization_target_dbfs),
+            spectral_band_gain: editor.spectral_band_gain(),
         };
 
         if self.audio_engine.is_none() {
@@ -31600,6 +31820,10 @@ impl DawUi {
                         normalize_export: false,
                         normalization_target_dbfs: 0.0,
                         reverse_export: false,
+                        spectral_band_enabled: false,
+                        spectral_band_low_hz: 200.0,
+                        spectral_band_high_hz: 8_000.0,
+                        spectral_band_gain_db: -12.0,
                     });
                 }
                 Err(error) => {
@@ -31774,7 +31998,7 @@ impl DawUi {
                     );
                 });
                 if editor.audio.channels.len() > 2 {
-                    ui.small("Pitch shift and time stretch are available for mono and stereo samples.");
+                    ui.small("Pitch shift, time stretch, and spectral band gain are available for mono and stereo samples.");
                 } else {
                     ui.small("1.00× keeps duration; above 1 lengthens, below 1 shortens. Stretch preserves pitch and uses transient detection.");
                 }
@@ -31800,6 +32024,38 @@ impl DawUi {
                     );
                 });
                 ui.checkbox(&mut editor.reverse_export, "Reverse selection on export");
+                ui.add_enabled_ui(editor.audio.channels.len() <= 2, |ui| {
+                    ui.checkbox(&mut editor.spectral_band_enabled, "Spectral band gain");
+                    if editor.spectral_band_enabled {
+                        let nyquist = (editor.audio.sample_rate as f32 / 2.0).max(40.0);
+                        editor.spectral_band_low_hz =
+                            editor.spectral_band_low_hz.clamp(20.0, nyquist);
+                        editor.spectral_band_high_hz = editor
+                            .spectral_band_high_hz
+                            .clamp(editor.spectral_band_low_hz * 1.01, nyquist);
+                        ui.add(
+                            egui::Slider::new(
+                                &mut editor.spectral_band_low_hz,
+                                20.0..=nyquist,
+                            )
+                            .logarithmic(true)
+                            .text("Band low (Hz)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(
+                                &mut editor.spectral_band_high_hz,
+                                20.0..=nyquist,
+                            )
+                            .logarithmic(true)
+                            .text("Band high (Hz)"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut editor.spectral_band_gain_db, -60.0..=24.0)
+                                .step_by(0.1)
+                                .text("Band gain (dB)"),
+                        );
+                    }
+                });
                 ui.horizontal(|ui| {
                     preview_selection = ui
                         .add_enabled(
@@ -31807,7 +32063,7 @@ impl DawUi {
                             egui::Button::new("▶ Preview processed selection"),
                         )
                         .on_hover_text(
-                            "Audition the selected range with the current pitch, stretch, fade, normalization, and reverse settings",
+                            "Audition the selected range with the current pitch, stretch, spectral band, fade, normalization, and reverse settings",
                         )
                         .clicked();
                     if preview_pending || preview_active {
@@ -31832,7 +32088,7 @@ impl DawUi {
                     {
                         save_selection = true;
                     }
-                    ui.small("Pitch, time stretch, fades, normalization, and reversal apply to the export; the source stays unchanged.");
+                    ui.small("Pitch, time stretch, spectral band gain, fades, normalization, and reversal apply to the export; the source stays unchanged.");
                 });
                 if export_pending {
                     ui.horizontal(|ui| {
@@ -31927,6 +32183,7 @@ impl DawUi {
             normalization_target_dbfs: editor
                 .normalize_export
                 .then_some(editor.normalization_target_dbfs),
+            spectral_band_gain: editor.spectral_band_gain(),
         };
         let worker_output_path = output_path.clone();
         let (sender, receiver) = mpsc::channel();
@@ -84524,6 +84781,7 @@ impl eframe::App for DawUi {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.hover_hint = None;
         self.publish_live_pattern_note_updates();
         self.publish_midi_script_transport_state();
         let vst2_channel_editor_failures = self
@@ -84560,6 +84818,17 @@ impl eframe::App for DawUi {
         ui.ctx().set_theme(egui::Theme::Dark);
         let dark_style = ui.ctx().global_style();
         ui.set_style(dark_style);
+        // Apply or remove the touch-sized control metrics on the shared
+        // style whenever the persisted setting changes (including the first
+        // frame of a launch that starts with the setting enabled).
+        if self.touch_controls_style_applied != self.touch_controls {
+            self.touch_controls_style_applied = self.touch_controls;
+            let mut style = egui::Style::default();
+            if self.touch_controls {
+                apply_touch_controls_spacing(&mut style);
+            }
+            ui.ctx().set_style_of(egui::Theme::Dark, style);
+        }
         // The root Ui can be created before a native backend reports its
         // system theme. Keep its widget visuals on the app palette as well.
         *ui.visuals_mut() = app_visuals();
@@ -85471,7 +85740,9 @@ impl eframe::App for DawUi {
                             ui.horizontal_centered(|ui| {
                                 ui.label(if self.dirty { "●" } else { "" })
                                     .on_hover_text("Unsaved project changes");
-                                ui.label(&self.status);
+                                // Hint bar: the hovered control's hint wins
+                                // over the standing status message.
+                                ui.label(self.hover_hint.as_deref().unwrap_or(&self.status));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -85500,8 +85771,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::PianoRoll,
                 "Piano roll",
                 Vec2::new(1120.0, 720.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::PianoRoll),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::PianoRoll),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85647,8 +85917,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Mixer,
                 "Mixer",
                 Vec2::new(1080.0, 640.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Mixer),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Mixer),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85778,8 +86047,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::ChannelRack,
                 "Channel Rack",
                 Vec2::new(980.0, 640.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::ChannelRack),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::ChannelRack),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -85909,8 +86177,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Playlist,
                 "Playlist",
                 Vec2::new(1280.0, 760.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Playlist),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Playlist),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -86040,8 +86307,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Plugins,
                 "Plug-ins",
                 Vec2::new(1000.0, 700.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Plugins),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Plugins),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -86060,8 +86326,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Audio,
                 "Audio",
                 Vec2::new(900.0, 720.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Audio),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Audio),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -86080,8 +86345,7 @@ impl eframe::App for DawUi {
                 DetachedWindowKind::Automation,
                 "Automation",
                 Vec2::new(1020.0, 700.0),
-                self.detached_window_placements
-                    .get(DetachedWindowKind::Automation),
+                self.monitor_checked_detached_placement(ui.ctx(), DetachedWindowKind::Automation),
             );
             let context = ui.ctx().clone();
             context.show_viewport_immediate(viewport_id, viewport, |viewport_ui, _class| {
@@ -94361,6 +94625,31 @@ fn load_hide_collapsed_playlist_groups() -> bool {
         .unwrap_or(true)
 }
 
+fn touch_controls_settings_file() -> Option<PathBuf> {
+    browser_favorites_file()?
+        .parent()
+        .map(|directory| directory.join("touch-controls.txt"))
+}
+
+fn load_touch_controls() -> bool {
+    touch_controls_settings_file()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|contents| contents.trim().parse::<bool>().ok())
+        .unwrap_or(false)
+}
+
+fn save_touch_controls(enabled: bool) -> Result<(), String> {
+    let path = touch_controls_settings_file()
+        .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "the touch controls settings path has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
+    fs::write(&path, format!("{enabled}\n"))
+        .map_err(|error| format!("could not write {}: {error}", path.display()))
+}
+
 fn save_hide_collapsed_playlist_groups(enabled: bool) -> Result<(), String> {
     let path = hide_collapsed_playlist_groups_settings_file()
         .ok_or_else(|| "the user configuration folder is not available".to_owned())?;
@@ -100710,10 +100999,12 @@ mod tests {
         PluginFormat, ProjectPlaylistAudioClipEnvelope, TimeSelectionShift, TouchGesture,
         TouchTapTracker, TouchZoomConfig, Vst3PlaylistAutomationPoint,
         Vst3PlaylistParameterAutomation, WINDOW_LAYOUT_PRESETS_HEADER, WindowLayoutPreset,
-        audio_recording_start_tick_with_offset, browser_audio_drop_tempo_sync,
+        apply_touch_controls_spacing, audio_recording_start_tick_with_offset,
+        browser_audio_drop_tempo_sync,
         built_in_midi_controller_templates, candidate_live_mixer_send_key,
         candidate_matches_vst_identity, candidate_mixer_controls,
-        candidate_mixer_stereo_separation, detect_chord_name, detect_piano_roll_channel_scale,
+        candidate_mixer_stereo_separation, detached_placement_with_visible_position,
+        detect_chord_name, detect_piano_roll_channel_scale,
         detect_piano_roll_scale, encode_midi_device_id, encode_midi_device_selections,
         encode_midi_output_routes, first_available_playlist_track,
         internal_lfo_parameter_automation, internal_lfo_parameter_link_for_target,
@@ -106111,6 +106402,107 @@ mod tests {
         let encoded = serialize_window_layout_presets(std::slice::from_ref(&preset));
         let decoded = parse_window_layout_presets(&encoded);
         assert_eq!(decoded, vec![preset]);
+    }
+
+    #[test]
+    fn detached_placement_position_is_kept_when_the_window_is_reachable() {
+        // Main window 1200x800 at (100, 100) on a 1920x1080 monitor.
+        let main_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 100.0),
+            eframe::egui::vec2(1200.0, 800.0),
+        );
+        let monitor_size = eframe::egui::vec2(1920.0, 1080.0);
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(1500.0, 200.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        let checked = detached_placement_with_visible_position(
+            Some(placement),
+            Some(main_rect),
+            Some(monitor_size),
+        )
+        .expect("placement should survive the check");
+        assert_eq!(checked.position, placement.position);
+        assert_eq!(checked.inner_size, placement.inner_size);
+    }
+
+    #[test]
+    fn detached_placement_position_is_dropped_when_its_monitor_is_gone() {
+        let main_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 100.0),
+            eframe::egui::vec2(1200.0, 800.0),
+        );
+        let monitor_size = eframe::egui::vec2(1920.0, 1080.0);
+        // Saved on a second 1920-wide monitor to the right that has since
+        // been disconnected.
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(2100.0, 150.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        let checked = detached_placement_with_visible_position(
+            Some(placement),
+            Some(main_rect),
+            Some(monitor_size),
+        )
+        .expect("placement should survive the check");
+        assert_eq!(checked.position, None);
+        assert_eq!(checked.inner_size, placement.inner_size);
+    }
+
+    #[test]
+    fn detached_placement_position_is_dropped_when_only_a_sliver_is_visible() {
+        let main_rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(100.0, 100.0),
+            eframe::egui::vec2(1200.0, 800.0),
+        );
+        let monitor_size = eframe::egui::vec2(1920.0, 1080.0);
+        // The visible region ends at x = 1300 + (1920 - 1200) = 2020; a
+        // window starting at 1990 leaves only 30 points reachable.
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(1990.0, 150.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        let checked = detached_placement_with_visible_position(
+            Some(placement),
+            Some(main_rect),
+            Some(monitor_size),
+        )
+        .expect("placement should survive the check");
+        assert_eq!(checked.position, None);
+    }
+
+    #[test]
+    fn touch_controls_spacing_raises_minimums_and_is_idempotent() {
+        let mut style = eframe::egui::Style::default();
+        let defaults = style.spacing.clone();
+        apply_touch_controls_spacing(&mut style);
+        assert!(style.spacing.interact_size.x >= 44.0);
+        assert!(style.spacing.interact_size.y >= 40.0);
+        assert!(style.spacing.button_padding.x >= 12.0);
+        assert!(style.spacing.button_padding.y >= 10.0);
+        assert!(style.spacing.slider_rail_height >= 8.0);
+        assert!(style.spacing.interact_size.x >= defaults.interact_size.x);
+        let once = style.spacing.clone();
+        apply_touch_controls_spacing(&mut style);
+        assert_eq!(style.spacing.interact_size, once.interact_size);
+        assert_eq!(style.spacing.button_padding, once.button_padding);
+        assert_eq!(style.spacing.slider_rail_height, once.slider_rail_height);
+    }
+
+    #[test]
+    fn detached_placement_is_unchanged_without_monitor_geometry() {
+        let placement = DetachedWindowPlacement {
+            position: Some(eframe::egui::pos2(4000.0, 150.0)),
+            inner_size: eframe::egui::vec2(900.0, 600.0),
+        };
+        assert_eq!(
+            detached_placement_with_visible_position(Some(placement), None, None),
+            Some(placement)
+        );
+        assert_eq!(
+            detached_placement_with_visible_position(None, None, None),
+            None
+        );
     }
 
     #[test]
