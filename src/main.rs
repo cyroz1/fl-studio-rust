@@ -14739,17 +14739,21 @@ fn delete_time_marker(
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_automation_interpolation_mode, parse_clip_indices, parse_midi_channel_filter,
-        parse_midi_channel_mask, parse_midi_channel_number, parse_midi_import_options,
+        delete_note, delete_notes_with_scope, parse_automation_interpolation_mode,
+        parse_clip_indices, parse_midi_channel_filter, parse_midi_channel_mask,
+        parse_midi_channel_number, parse_midi_import_options,
         parse_midi_import_options_with_channels, parse_midi_import_options_with_mixer_tracks,
         parse_midi_pattern_target, parse_midi_track_selection, parse_mixer_eq_parameter_kind,
-        parse_mixer_track, parse_raw_byte, parse_rgb_hex, parse_sampler_envelope_lfo_target,
-        parse_scale_name, pattern_color_label, playlist_pattern_color_label,
+        parse_mixer_track, parse_note_indices, parse_raw_byte, parse_rgb_hex,
+        parse_sampler_envelope_lfo_target, parse_scale_name, pattern_color_label,
+        playlist_pattern_color_label,
     };
     use flp_rebuild::{
-        AutomationInterpolationMode, MixerParameterKind, SamplerEnvelopeLfoTarget,
+        AutomationInterpolationMode, FlpDocument, MixerParameterKind, SamplerEnvelopeLfoTarget,
         midi::MidiImportOptions,
     };
+    use std::fs;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn parses_automation_interpolation_modes() {
@@ -15133,5 +15137,188 @@ mod tests {
             Ok(&[0, 1, 3, 4, 6, 9, 10][..])
         );
         assert!(parse_scale_name("unknown").is_err());
+    }
+
+    fn cli_note_record(
+        position: u32,
+        channel_id: u16,
+        length: u32,
+        key: u16,
+        velocity: u8,
+    ) -> [u8; 24] {
+        // The 24-byte FLP note record layout with the observed neutral defaults:
+        // flags 0x4000, fine pitch 120, release 64, centered pan, Mod X/Y 128.
+        let mut record = [0u8; 24];
+        record[0..4].copy_from_slice(&position.to_le_bytes());
+        record[4..6].copy_from_slice(&0x4000u16.to_le_bytes());
+        record[6..8].copy_from_slice(&channel_id.to_le_bytes());
+        record[8..12].copy_from_slice(&length.to_le_bytes());
+        record[12..14].copy_from_slice(&key.to_le_bytes());
+        record[16] = 120;
+        record[18] = 64;
+        record[20] = 64;
+        record[21] = velocity;
+        record[22] = 128;
+        record[23] = 128;
+        record
+    }
+
+    fn cli_pattern_project(records: &[[u8; 24]]) -> Vec<u8> {
+        assert!(
+            records.len() * 24 < 128,
+            "fixture note payload must fit a one-byte length prefix"
+        );
+        let mut stream = vec![
+            0x40,
+            0,
+            0, // Channel 0 header.
+            0x40,
+            1,
+            0, // Channel 1 header.
+            0x41,
+            7,
+            0, // Pattern 7 marker.
+            0xD0,
+            (records.len() * 24) as u8,
+        ];
+        for record in records {
+            stream.extend_from_slice(record);
+        }
+        stream.extend_from_slice(&[0xFF, 1, 0x5A]); // Unrelated event that must survive edits.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"FLhd");
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&96u16.to_le_bytes());
+        bytes.push(0xA1);
+        bytes.extend_from_slice(b"FLdt");
+        bytes.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&stream);
+        bytes.push(0xB2);
+        bytes
+    }
+
+    fn cli_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("flp-rebuild-cli-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("test directory should be created");
+        dir
+    }
+
+    fn read_cli_output(path: &Path) -> FlpDocument {
+        let bytes = fs::read(path).expect("CLI output should exist");
+        FlpDocument::parse(&bytes).expect("CLI output should parse")
+    }
+
+    fn output_note_positions(document: &FlpDocument) -> Vec<(u16, u32, u16)> {
+        document.patterns().unwrap()[0]
+            .notes
+            .iter()
+            .map(|note| (note.channel_id, note.position, note.key))
+            .collect()
+    }
+
+    #[test]
+    fn cli_delete_note_removes_one_channel_note_and_preserves_the_rest() {
+        let dir = cli_test_dir("delete-note");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[
+                cli_note_record(0, 0, 48, 60, 100),
+                cli_note_record(12, 1, 24, 48, 80),
+                cli_note_record(24, 0, 36, 64, 90),
+            ]),
+        )
+        .expect("fixture should be written");
+
+        delete_note(&input, &output, 7, 0, 1).expect("delete-note should succeed");
+
+        let document = read_cli_output(&output);
+        assert_eq!(output_note_positions(&document), [(0, 0, 60), (1, 12, 48)]);
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_delete_notes_removes_the_whole_channel() {
+        let dir = cli_test_dir("delete-notes");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[
+                cli_note_record(0, 0, 48, 60, 100),
+                cli_note_record(12, 1, 24, 48, 80),
+                cli_note_record(24, 0, 36, 64, 90),
+                cli_note_record(36, 1, 12, 52, 70),
+            ]),
+        )
+        .expect("fixture should be written");
+
+        delete_notes_with_scope(&input, &output, 7, 0, None).expect("delete-notes should succeed");
+
+        let document = read_cli_output(&output);
+        assert_eq!(output_note_positions(&document), [(1, 12, 48), (1, 36, 52)]);
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_delete_notes_selected_removes_only_the_listed_indexes() {
+        let dir = cli_test_dir("delete-notes-selected");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[
+                cli_note_record(0, 0, 48, 60, 100),
+                cli_note_record(12, 1, 24, 48, 80),
+                cli_note_record(24, 0, 36, 64, 90),
+                cli_note_record(36, 1, 12, 52, 70),
+                cli_note_record(48, 0, 24, 67, 80),
+            ]),
+        )
+        .expect("fixture should be written");
+
+        let indices = parse_note_indices("0,2").expect("note indexes should parse");
+        delete_notes_with_scope(&input, &output, 7, 0, Some(&indices))
+            .expect("delete-notes-selected should succeed");
+
+        let document = read_cli_output(&output);
+        assert_eq!(
+            output_note_positions(&document),
+            [(1, 12, 48), (0, 24, 64), (1, 36, 52)]
+        );
+        assert_eq!(
+            document.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_delete_note_out_of_range_errors_and_writes_nothing() {
+        let dir = cli_test_dir("delete-note-missing");
+        let input = dir.join("input.flp");
+        let output = dir.join("output.flp");
+        fs::write(
+            &input,
+            cli_pattern_project(&[cli_note_record(0, 0, 48, 60, 100)]),
+        )
+        .expect("fixture should be written");
+
+        assert!(delete_note(&input, &output, 7, 0, 1).is_err());
+        assert!(!output.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

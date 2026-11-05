@@ -43880,6 +43880,168 @@ mod tests {
     }
 
     #[test]
+    fn deleting_every_note_in_an_event_round_trips_with_an_empty_payload() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 48, 60, 100),
+                note_record(96, 0, 24, 64, 80),
+            ],
+            &[0xFF, 1, 0x5A],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .delete_pattern_notes(7, 0)
+                .expect("channel notes should be deleted"),
+            2
+        );
+        assert!(document.patterns().unwrap()[0].notes.is_empty());
+
+        let encoded = document
+            .encode_lossless()
+            .expect("emptied project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("emptied project should parse");
+        assert!(reparsed.patterns().unwrap()[0].notes.is_empty());
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+    }
+
+    #[test]
+    fn deleting_notes_from_a_missing_pattern_or_channel_errors_without_mutation() {
+        let input = pattern_fixture(&[note_record(0, 0, 48, 60, 100)], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.encode_lossless().unwrap();
+
+        assert!(document.delete_pattern_note(99, 0, 0).is_err());
+        assert!(document.delete_pattern_notes(99, 0).is_err());
+        assert!(document.delete_pattern_note_selection(99, 0, &[0]).is_err());
+        assert!(document.delete_pattern_note(7, 9, 0).is_err());
+        assert!(document.delete_pattern_notes(7, 9).is_err());
+        assert!(document.delete_pattern_note_selection(7, 9, &[0]).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn deleting_a_single_note_out_of_range_errors_without_mutation() {
+        let input = pattern_fixture(&[note_record(0, 0, 48, 60, 100)], &[0xFF, 0]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.encode_lossless().unwrap();
+
+        assert!(document.delete_pattern_note(7, 0, 1).is_err());
+        assert_eq!(document.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn deleting_selected_notes_deduplicates_repeated_indexes() {
+        let input = pattern_fixture(
+            &[
+                note_record(0, 0, 48, 60, 100),
+                note_record(24, 0, 24, 64, 90),
+                note_record(48, 0, 24, 67, 80),
+            ],
+            &[0xFF, 0],
+        );
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .delete_pattern_note_selection(7, 0, &[2, 0, 2])
+                .expect("selected notes should be deleted"),
+            2
+        );
+        let remaining = document.patterns().unwrap()[0].notes.clone();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].position, 24);
+        assert_eq!(remaining[0].key, 64);
+    }
+
+    #[test]
+    fn deleting_channel_notes_from_an_empty_channel_removes_nothing() {
+        let note = note_record(0, 0, 48, 60, 100);
+        let mut stream = vec![0x40, 0, 0, 0x40, 1, 0, 0x41, 7, 0, 0xD0, 0x18];
+        stream.extend_from_slice(&note);
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+        let before = document.encode_lossless().unwrap();
+
+        assert_eq!(
+            document
+                .delete_pattern_notes(7, 1)
+                .expect("deleting from an empty channel should succeed"),
+            0
+        );
+        assert_eq!(
+            document
+                .delete_pattern_note_selection(7, 1, &[])
+                .expect("an empty selection should succeed"),
+            0
+        );
+        assert_eq!(document.encode_lossless().unwrap(), before);
+    }
+
+    #[test]
+    fn deleting_notes_leaves_other_patterns_and_events_untouched() {
+        let first = note_record(0, 0, 48, 60, 100);
+        let second = note_record(24, 0, 24, 64, 90);
+        let other = note_record(48, 0, 24, 67, 80);
+        let mut stream = vec![0x40, 0, 0, 0x41, 7, 0, 0xD0, 0x30];
+        stream.extend_from_slice(&first);
+        stream.extend_from_slice(&second);
+        stream.extend_from_slice(&[0x41, 8, 0, 0xD0, 0x18]);
+        stream.extend_from_slice(&other);
+        stream.extend_from_slice(&[0xFF, 1, 0x5A]);
+        let input = flp_fixture(&stream, &[], &[]);
+        let mut document = FlpDocument::parse(&input).expect("fixture should parse");
+
+        assert_eq!(
+            document
+                .delete_pattern_notes(7, 0)
+                .expect("pattern 7 notes should be deleted"),
+            2
+        );
+        let patterns = document.patterns().unwrap();
+        assert!(
+            patterns
+                .iter()
+                .find(|pattern| pattern.id == 7)
+                .unwrap()
+                .notes
+                .is_empty()
+        );
+        assert_eq!(
+            patterns
+                .iter()
+                .find(|pattern| pattern.id == 8)
+                .unwrap()
+                .notes
+                .len(),
+            1
+        );
+
+        let encoded = document
+            .encode_lossless()
+            .expect("edited project should encode");
+        let reparsed = FlpDocument::parse(&encoded).expect("edited project should parse");
+        let patterns = reparsed.patterns().unwrap();
+        assert_eq!(
+            patterns
+                .iter()
+                .find(|pattern| pattern.id == 8)
+                .unwrap()
+                .notes[0]
+                .key,
+            67
+        );
+        assert_eq!(
+            reparsed.events().last().unwrap().wire_bytes(),
+            &[0xFF, 1, 0x5A]
+        );
+    }
+
+    #[test]
     fn imports_midi_track_notes_scaled_to_project_ppq_and_preserves_other_events() {
         let original_note = note_record(0, 0, 48, 48, 80);
         let unknown_event = [0xFF, 0x02, 0xAA, 0xBB];
