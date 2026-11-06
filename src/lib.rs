@@ -20,6 +20,15 @@ const FLP_PLAYLIST_RECORD_SIZES: [usize; 4] = [88, 80, 60, 32];
 const LEGACY_PATTERN_BLOCK_ITEM_INDEX: u16 = 0x6000;
 const LEGACY_PATTERN_BLOCK_PATTERN_INDEX_BASE: u16 = 999;
 const MAX_MERGED_PATTERN_NOTES: usize = 2_000_000;
+/// Upper bound on the byte size of a project file the FLP parser accepts.
+/// Real FLP files are a few megabytes; this leaves generous headroom while
+/// keeping a crafted file from being read into memory without limit.
+const MAX_FLP_INPUT_BYTES: usize = 256 * 1024 * 1024;
+/// Upper bound on the number of events retained from one FLP stream.
+/// Each parsed event retains its payload twice (payload and wire bytes)
+/// plus fixed per-event overhead, so an unbounded event count would let a
+/// small file of minimum-size events amplify into disproportionate memory.
+const MAX_FLP_EVENTS: usize = 2_000_000;
 const FLP_AUTOMATION_LFO_AMOUNT_OFFSET: usize = 4;
 const FLP_AUTOMATION_COUNT_OFFSET: usize = 17;
 const FLP_AUTOMATION_POINTS_OFFSET: usize = 21;
@@ -6681,6 +6690,12 @@ impl ProjectMetadata {
 
 impl FlpDocument {
     pub fn parse(bytes: &[u8]) -> Result<Self, FlpError> {
+        if bytes.len() > MAX_FLP_INPUT_BYTES {
+            return Err(FlpError::InvalidEvent {
+                offset: 0,
+                detail: "project file exceeds the parser input size limit",
+            });
+        }
         if bytes.len() < 8 {
             return Err(FlpError::UnexpectedEof {
                 offset: bytes.len(),
@@ -6745,6 +6760,12 @@ impl FlpDocument {
         let mut events = Vec::new();
         let mut cursor = 0usize;
         while cursor < stream.len() {
+            if events.len() >= MAX_FLP_EVENTS {
+                return Err(FlpError::InvalidEvent {
+                    offset: event_start + cursor,
+                    detail: "project exceeds the parser event count limit",
+                });
+            }
             let (event, next_cursor) = parse_event(stream, cursor, event_start, modern_ac_event)?;
             if next_cursor <= cursor {
                 return Err(FlpError::InvalidEvent {
@@ -30754,7 +30775,7 @@ mod tests {
         ChannelStretchMode, ChannelStretchSettingsEdit, ChannelSummary, ClawMachineOptions,
         FLP_AUTOMATION_COUNT_OFFSET, FLP_AUTOMATION_LFO_AMOUNT_OFFSET, FLP_AUTOMATION_POINT_SIZE,
         FLP_AUTOMATION_POINTS_OFFSET, FlpDocument, FlpError, FlpEvent, FstPreset, FstPresetKind,
-        LimitNoteOptions, LimitSnapDirection, MixerInsertEdit, MixerInsertSummary,
+        LimitNoteOptions, LimitSnapDirection, MAX_FLP_EVENTS, MixerInsertEdit, MixerInsertSummary,
         MixerLiveInsertEnabledGain, MixerLiveSendGain, MixerLiveSendOutputPath,
         MixerLiveSendTargetKey, MixerParameterKind, MixerParameterRecord, MixerRouteAudibility,
         MixerSendSummary, MixerSourceRouteTransform, PATTERN_NOTE_DEFAULT_FLAGS,
@@ -30826,6 +30847,31 @@ mod tests {
                 fixture
             );
         }
+    }
+
+    #[test]
+    fn parse_rejects_event_streams_past_the_event_count_limit() {
+        // A Byte event is two wire bytes (opcode plus one payload byte), so
+        // this stream is only about twice the event limit in bytes while
+        // asking the parser to retain far more per event.
+        let mut event_stream = Vec::with_capacity((MAX_FLP_EVENTS + 1) * 2);
+        for _ in 0..=MAX_FLP_EVENTS {
+            event_stream.extend_from_slice(&[0x00, 0x00]);
+        }
+        let fixture = flp_fixture(&event_stream, &[], &[]);
+        let error = FlpDocument::parse(&fixture).expect_err("over-limit stream should not parse");
+        assert!(
+            matches!(error, FlpError::InvalidEvent { .. }),
+            "unexpected error: {error}"
+        );
+
+        let mut at_limit_stream = Vec::with_capacity(MAX_FLP_EVENTS * 2);
+        for _ in 0..MAX_FLP_EVENTS {
+            at_limit_stream.extend_from_slice(&[0x00, 0x00]);
+        }
+        let fixture = flp_fixture(&at_limit_stream, &[], &[]);
+        let document = FlpDocument::parse(&fixture).expect("at-limit stream should parse");
+        assert_eq!(document.events().len(), MAX_FLP_EVENTS);
     }
 
     #[test]
