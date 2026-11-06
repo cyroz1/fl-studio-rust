@@ -2309,6 +2309,20 @@ fn decode_wavpack_file(
             path.display()
         ));
     }
+    // The pre-decode estimate above is derived from header fields (frame
+    // counts and the stream channel count), but a block may carry more
+    // channels than the stream header declares. Re-check the samples that
+    // were actually decoded against the cap before they are retained.
+    let decoded_output_bytes = (decoded.samples.len() as u64)
+        .checked_mul(std::mem::size_of::<f32>() as u64)
+        .ok_or_else(|| "WavPack decoded sample count overflow".to_owned())?;
+    if decoded_output_bytes > MAX_DECODED_SAMPLE_BYTES as u64 {
+        return Err(format!(
+            "WavPack sample {} exceeds the {} MiB decoded sample limit",
+            path.display(),
+            MAX_DECODED_SAMPLE_BYTES / (1024 * 1024)
+        ));
+    }
     let channel_count = usize::try_from(decoded.channels)
         .map_err(|_| "WavPack channel count does not fit this platform".to_owned())?;
     if !decoded.samples.len().is_multiple_of(channel_count) {
@@ -2558,6 +2572,16 @@ fn expand_environment_tokens(value: &str) -> Result<String, String> {
         };
         let end = token_start + relative_end;
         let name = &value[token_start..end];
+        // Only FL Studio's own data-location variables may be expanded.
+        // Expanding arbitrary host variables (for example %HOME% or
+        // %USERPROFILE%) would let a project file author aim a sample path
+        // at files whose locations they can guess without knowing the user,
+        // and the package bundler copies whatever this resolution finds.
+        if !is_expandable_environment_variable(name) {
+            return Err(format!(
+                "sample path uses unsupported environment variable %{name}%"
+            ));
+        }
         let replacement = std::env::var_os(name)
             .or_else(|| alias_environment_variable(name))
             .ok_or_else(|| format!("sample path uses unset environment variable %{name}%"))?;
@@ -2566,6 +2590,19 @@ fn expand_environment_tokens(value: &str) -> Result<String, String> {
     }
     expanded.push_str(&value[cursor..]);
     Ok(expanded)
+}
+
+/// The environment variables a sample path may reference: the FL Studio
+/// factory/user data aliases plus the variables factory discovery reads.
+fn is_expandable_environment_variable(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "flstudiofactorydata"
+            | "fl_studio_factory_data"
+            | "fl_studio_root"
+            | "flstudiouserdata"
+            | "fl_studio_user_data"
+    )
 }
 
 fn alias_environment_variable(name: &str) -> Option<std::ffi::OsString> {
@@ -3692,6 +3729,50 @@ mod tests {
 
         let resolved = resolver.resolve(r"audio\voice.wav").unwrap();
         assert_eq!(resolved, asset);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sample_paths_expand_only_fl_studio_environment_variables() {
+        for name in [
+            "FLStudioFactoryData",
+            "FL_Studio_Factory_Data",
+            "FL_STUDIO_ROOT",
+            "FLStudioUserData",
+            "fl_studio_user_data",
+        ] {
+            assert!(is_expandable_environment_variable(name), "{name}");
+        }
+        for name in ["HOME", "USERPROFILE", "PATH", "TEMP", "APPDATA"] {
+            assert!(!is_expandable_environment_variable(name), "{name}");
+        }
+
+        // %HOME% is rejected before any lookup, whether or not it is set:
+        // a project file must not be able to aim a sample path at a guessed
+        // host location through the host's own environment.
+        let error = expand_environment_tokens(r"%HOME%\Documents\secret.txt")
+            .expect_err("host variables must not expand");
+        assert!(
+            error.contains("unsupported environment variable"),
+            "{error}"
+        );
+        assert_eq!(
+            expand_environment_tokens("plain/relative.wav").unwrap(),
+            "plain/relative.wav"
+        );
+
+        let root = fixture_root();
+        let project_directory = root.join("Projects");
+        std::fs::create_dir_all(&project_directory).unwrap();
+        let resolver = SamplePathResolver::new(project_directory.join("song.flp"));
+        let error = resolver
+            .resolve(r"%USERPROFILE%\Documents\secret.txt")
+            .expect_err("host variable paths must not resolve");
+        assert!(
+            error.contains("unsupported environment variable"),
+            "{error}"
+        );
 
         std::fs::remove_dir_all(root).unwrap();
     }
