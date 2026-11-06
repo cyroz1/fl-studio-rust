@@ -14,6 +14,13 @@ use crate::media::SamplePathResolver;
 
 static WORKSPACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Bounds on package extraction. A project package is an untrusted file:
+/// without caps, a small archive could expand without limit into the
+/// temporary workspace directory.
+const MAX_PACKAGE_ENTRIES: usize = 10_000;
+const MAX_PACKAGE_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_PACKAGE_EXTRACTED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Copies a sample to a directory under a collision-safe “(Unique)” filename.
 /// Existing files are never overwritten.
 pub fn copy_unique_sample_file(
@@ -197,6 +204,12 @@ impl ProjectPackageWorkspace {
             .map_err(|error| format!("could not open {}: {error}", path.as_ref().display()))?;
         let mut archive = ZipArchive::new(source)
             .map_err(|error| format!("could not read ZIP project: {error}"))?;
+        if archive.len() > MAX_PACKAGE_ENTRIES {
+            return Err(format!(
+                "ZIP project contains {} entries, more than the {MAX_PACKAGE_ENTRIES} entry limit",
+                archive.len()
+            ));
+        }
         let mut source_headers = File::open(path.as_ref()).map_err(|error| {
             format!(
                 "could not inspect ZIP project {}: {error}",
@@ -207,6 +220,7 @@ impl ProjectPackageWorkspace {
         let root = workspace_directory.path();
         let mut project_files = Vec::new();
         let mut extracted_files = HashSet::new();
+        let mut extracted_bytes = 0u64;
         let mut entry_order = Vec::new();
         let mut ordered_paths = HashSet::new();
         let mut entry_metadata = HashMap::new();
@@ -323,18 +337,38 @@ impl ProjectPackageWorkspace {
                     parent.display()
                 )
             })?;
+            if entry.size() > MAX_PACKAGE_ENTRY_BYTES {
+                return Err(format!(
+                    "ZIP project entry {raw_name:?} is larger than the {MAX_PACKAGE_ENTRY_BYTES} byte per-file extraction limit"
+                ));
+            }
             let mut output = File::create(&target).map_err(|error| {
                 format!(
                     "could not create package file {}: {error}",
                     target.display()
                 )
             })?;
-            io::copy(&mut entry, &mut output).map_err(|error| {
+            // Count the bytes actually written rather than trusting the
+            // declared entry size, so a lying header cannot bypass the caps.
+            let copied = io::copy(&mut entry, &mut output).map_err(|error| {
                 format!(
                     "could not extract package file {}: {error}",
                     target.display()
                 )
             })?;
+            if copied > MAX_PACKAGE_ENTRY_BYTES {
+                return Err(format!(
+                    "ZIP project entry {raw_name:?} extracted past the {MAX_PACKAGE_ENTRY_BYTES} byte per-file limit"
+                ));
+            }
+            extracted_bytes = extracted_bytes
+                .checked_add(copied)
+                .ok_or_else(|| "ZIP project extracted size overflow".to_owned())?;
+            if extracted_bytes > MAX_PACKAGE_EXTRACTED_BYTES {
+                return Err(format!(
+                    "ZIP project extracted past the {MAX_PACKAGE_EXTRACTED_BYTES} byte total extraction limit"
+                ));
+            }
             entry_metadata.insert(relative_path.clone(), metadata);
 
             if relative_path
@@ -444,7 +478,13 @@ impl ProjectPackageWorkspace {
         document: &mut FlpDocument,
         source_project_path: impl AsRef<Path>,
     ) -> Result<SampleBundleSummary, String> {
+        let source_project_path = source_project_path.as_ref();
         let resolver = SamplePathResolver::new(source_project_path);
+        // Only files inside the project folder or a known FL Studio root
+        // may be copied into an exported package. A resolved path anywhere
+        // else stays an external reference: copying it would disclose the
+        // host file to whoever receives the package.
+        let bundle_roots = bundle_containment_roots(source_project_path, resolver.factory_roots());
         let mut packaged_document = document.clone();
         let mut bundled_sources = HashMap::<PathBuf, PathBuf>::new();
         let mut reserved_paths = HashSet::<String>::new();
@@ -470,6 +510,15 @@ impl ProjectPackageWorkspace {
                     resolved.display()
                 )
             })?;
+            if !is_bundled_sample_format(&canonical_source)
+                || !path_is_within_roots(&canonical_source, &bundle_roots)
+            {
+                // Not a sample format, or resolved outside the project and
+                // FL Studio roots: leave the reference external and report
+                // it with the other unresolved references.
+                summary.unresolved_references += 1;
+                continue;
+            }
             let relative_path = if let Some(relative) = bundled_sources.get(&canonical_source) {
                 relative.clone()
             } else {
@@ -1557,6 +1606,50 @@ struct ArchiveRewriteEntry {
     central_uses_utf8_name: bool,
 }
 
+/// Canonical roots a resolved sample must live under to be copied into an
+/// exported package: the project folder and every known FL Studio root.
+/// Factory roots named `Data` also contribute their parent, mirroring
+/// `factory_root_candidates`.
+fn bundle_containment_roots(project_path: &Path, factory_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_canonical = |path: &Path| {
+        if let Ok(canonical) = path.canonicalize()
+            && !roots.contains(&canonical)
+        {
+            roots.push(canonical);
+        }
+    };
+    if let Some(project_directory) = project_path.parent() {
+        push_canonical(project_directory);
+    }
+    for root in factory_roots {
+        push_canonical(root);
+        if root
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("Data"))
+            && let Some(parent) = root.parent()
+        {
+            push_canonical(parent);
+        }
+    }
+    roots
+}
+
+fn path_is_within_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+/// The audio formats the sample pipeline decodes; anything else a project
+/// names as a sample path is not copied into an exported package.
+fn is_bundled_sample_format(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().to_ascii_lowercase().as_str(),
+            "wav" | "wave" | "mp3" | "m4a" | "ogg" | "flac" | "aif" | "aiff" | "wv"
+        )
+    })
+}
+
 fn sample_archive_path(sample_path: &str) -> PathBuf {
     let filename = sample_path
         .rsplit(['/', '\\'])
@@ -1888,6 +1981,82 @@ mod tests {
             .unwrap();
         assert_eq!(fs::read(first_resolved).unwrap(), b"left sample data");
         assert_eq!(fs::read(second_resolved).unwrap(), b"right sample data");
+    }
+
+    #[test]
+    fn bundling_skips_samples_outside_the_project_and_factory_roots() {
+        let temporary = TestDirectory::new();
+        let outside = TestDirectory::new();
+        let source_project = temporary.path().join("song.flp");
+        let outside_sample = outside.path().join("secret.wav");
+        fs::write(&outside_sample, b"host file contents").unwrap();
+        let inside_text = temporary.path().join("notes.txt");
+        fs::write(&inside_text, b"not audio").unwrap();
+
+        let outside_path = outside_sample.to_string_lossy().into_owned();
+        let project_bytes = sample_project_fixture(&[&outside_path, "notes.txt"]);
+        let mut document = FlpDocument::parse(&project_bytes).unwrap();
+        let workspace =
+            ProjectPackageWorkspace::single_project("song.flp", &project_bytes, &source_project)
+                .unwrap();
+        let summary = workspace
+            .bundle_channel_samples(&mut document, &source_project)
+            .unwrap();
+
+        // Neither file is copied: the first resolves outside every bundle
+        // root, the second is not a sample format. Both references stay
+        // external in the packaged document.
+        assert_eq!(summary.bundled_files, 0);
+        assert_eq!(summary.unresolved_references, 2);
+        assert_eq!(
+            document.channels()[0].sample_path(),
+            Some(outside_path.as_str())
+        );
+        assert_eq!(document.channels()[1].sample_path(), Some("notes.txt"));
+    }
+
+    #[test]
+    fn opening_a_package_rejects_too_many_entries() {
+        let temporary = TestDirectory::new();
+        let source_path = temporary.path().join("many.zip");
+        let mut source = ZipWriter::new(fs::File::create(&source_path).unwrap());
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for index in 0..=super::MAX_PACKAGE_ENTRIES {
+            source
+                .start_file(format!("entry-{index}.txt"), options)
+                .unwrap();
+            source.write_all(b"x").unwrap();
+        }
+        source.finish().unwrap();
+
+        let error = match ProjectPackageWorkspace::open(&source_path) {
+            Ok(_) => panic!("over-limit package should not open"),
+            Err(error) => error,
+        };
+        assert!(error.contains("entry limit"), "{error}");
+    }
+
+    #[test]
+    fn opening_a_package_rejects_an_oversized_entry() {
+        let temporary = TestDirectory::new();
+        let source_path = temporary.path().join("huge.zip");
+        let mut source = ZipWriter::new(fs::File::create(&source_path).unwrap());
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        source.start_file("huge.bin", options).unwrap();
+        let chunk = [0u8; 1024 * 1024];
+        let mut remaining = super::MAX_PACKAGE_ENTRY_BYTES + 1;
+        while remaining > 0 {
+            let take = remaining.min(chunk.len() as u64) as usize;
+            source.write_all(&chunk[..take]).unwrap();
+            remaining -= take as u64;
+        }
+        source.finish().unwrap();
+
+        let error = match ProjectPackageWorkspace::open(&source_path) {
+            Ok(_) => panic!("oversized-entry package should not open"),
+            Err(error) => error,
+        };
+        assert!(error.contains("per-file extraction limit"), "{error}");
     }
 
     #[test]
