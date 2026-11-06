@@ -1,5 +1,11 @@
 name: CI and desktop installers
 
+# macOS signing material is never present on pull_request runs: the APPLE_*
+# secrets are only read by steps gated on
+# `github.event_name != 'pull_request'`, so PR builds take the secretless
+# ad-hoc smoke path and no certificate or .p8 key is written to the runner
+# before repo-controlled build hooks and the packaged app execute.
+
 on:
   push:
     branches:
@@ -35,10 +41,10 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Install stable Rust
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           toolchain: stable
           components: clippy, rustfmt
@@ -89,7 +95,7 @@ jobs:
         run: cargo test --all-targets
 
       - name: Check macOS signing credentials
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && github.event_name != 'pull_request'
         id: macos-signing-status
         shell: bash
         env:
@@ -127,7 +133,7 @@ jobs:
           echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Prepare macOS signing and notarization
-        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        if: runner.os == 'macOS' && github.event_name != 'pull_request' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -1651,7 +1657,7 @@ jobs:
 
       - name: Upload Piano roll shortcut preview
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: gui-preview-${{ matrix.platform }}
           path: dist/gui-preview/piano-roll-ghost-channels-toggle.png
@@ -1701,7 +1707,7 @@ jobs:
             ' _ "$appimage" "$appimage_log"
 
       - name: Build signed and notarized macOS installer
-        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        if: runner.os == 'macOS' && github.event_name != 'pull_request' && steps.macos-signing-status.outputs.available == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -1778,7 +1784,7 @@ jobs:
           echo "Unsigned macOS app remained running after launch."
 
       - name: Sign, notarize, and verify macOS disk image
-        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        if: runner.os == 'macOS' && github.event_name != 'pull_request' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -1838,7 +1844,7 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app_path"
 
       - name: Verify macOS signature and notarization
-        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        if: runner.os == 'macOS' && github.event_name != 'pull_request' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         run: |
           shopt -s nullglob
@@ -1854,7 +1860,7 @@ jobs:
           spctl --assess --type execute --verbose=4 "$app_path"
 
       - name: Install and launch macOS app from disk image
-        if: runner.os == 'macOS' && steps.macos-signing-status.outputs.available == 'true'
+        if: runner.os == 'macOS' && github.event_name != 'pull_request' && steps.macos-signing-status.outputs.available == 'true'
         shell: bash
         run: |
           shopt -s nullglob
@@ -1993,7 +1999,7 @@ jobs:
 
       - name: Upload Linux packages
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
@@ -2002,7 +2008,7 @@ jobs:
 
       - name: Upload Windows setup installer
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
@@ -2011,7 +2017,7 @@ jobs:
 
       - name: Upload macOS disk image
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: installers-${{ matrix.platform }}
           path: dist/ci-installer/*
