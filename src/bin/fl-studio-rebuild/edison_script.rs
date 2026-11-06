@@ -189,6 +189,32 @@ pub fn load_last_edison_script(settings_file: &Path) -> Option<PathBuf> {
     script.is_file().then_some(script)
 }
 
+/// Find the discovered script for a path, when one exists.
+///
+/// The persisted last-script path is only ever honored through this match:
+/// the settings file lives in a per-user folder other local processes can
+/// write, so a stored path must not become an executed path unless it is
+/// one of the scripts discovery found in the script folders. This mirrors
+/// the MIDI controller script selection, which likewise refuses a stored
+/// path that no discovered script has. Exact path equality is tried first,
+/// then canonicalized equality for roots reached through symlinks.
+pub fn match_discovered_edison_script<'a>(
+    scripts: &'a [EdisonScript],
+    path: &Path,
+) -> Option<&'a EdisonScript> {
+    if let Some(script) = scripts.iter().find(|script| script.path == path) {
+        return Some(script);
+    }
+    let canonical = path.canonicalize().ok()?;
+    scripts.iter().find(|script| {
+        script
+            .path
+            .canonicalize()
+            .ok()
+            .is_some_and(|candidate| candidate == canonical)
+    })
+}
+
 pub fn save_last_edison_script(settings_file: &Path, script: &Path) -> Result<(), String> {
     if let Some(parent) = settings_file.parent() {
         fs::create_dir_all(parent).map_err(|error| {
@@ -566,8 +592,8 @@ fn parse_edison_dialog_spec(value: &Value) -> EdisonScriptDialogSpec {
 mod tests {
     use super::{
         discover_all_edison_scripts, discover_edison_scripts, edison_script_directories,
-        grouped_edison_scripts, load_last_edison_script, parse_last_edison_script,
-        save_last_edison_script, serialize_last_edison_script,
+        grouped_edison_scripts, load_last_edison_script, match_discovered_edison_script,
+        parse_last_edison_script, save_last_edison_script, serialize_last_edison_script,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -674,6 +700,29 @@ mod tests {
         // "files saved here will be visible the next time" discovery.
         fs::remove_file(&script).unwrap();
         assert_eq!(load_last_edison_script(&settings_file), None);
+    }
+
+    #[test]
+    fn last_script_matches_only_discovered_scripts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("Audio scripts");
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("Normalize.pyscript");
+        fs::write(&script, "# script").unwrap();
+        let outside = temporary.path().join("evil.py");
+        fs::write(&outside, "# planted").unwrap();
+        let unlisted = root.join("helper.py");
+        fs::write(&unlisted, "# not a script").unwrap();
+
+        let scripts = discover_edison_scripts(&root).unwrap();
+        assert_eq!(
+            match_discovered_edison_script(&scripts, &script).map(|found| found.name.as_str()),
+            Some("Normalize")
+        );
+        // An existing file outside the script folders never matches, and
+        // neither does a non-.pyscript file inside one.
+        assert!(match_discovered_edison_script(&scripts, &outside).is_none());
+        assert!(match_discovered_edison_script(&scripts, &unlisted).is_none());
     }
 
     #[test]

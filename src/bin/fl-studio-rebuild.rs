@@ -149,7 +149,8 @@ mod midi_thru;
 use edison_script::{
     EdisonScript, EdisonScriptDialogSpec, EdisonScriptInputKind, EdisonScriptRunOutcome,
     EdisonScriptSample, discover_all_edison_scripts, edison_script_directories,
-    grouped_edison_scripts, load_last_edison_script, run_edison_script, save_last_edison_script,
+    grouped_edison_scripts, load_last_edison_script, match_discovered_edison_script,
+    run_edison_script, save_last_edison_script,
 };
 use midi_input::{
     ConnectedMidiInput, MidiInputChannelState, MidiInputDevice, MidiInputEvent,
@@ -1151,13 +1152,78 @@ fn detect_chord_name(notes: &[PatternNote], channel_id: u16, position: u32) -> S
     format!("{} notes", pitch_classes.len())
 }
 
+/// Identity match strength for one VST3 candidate, or `None` when it does
+/// not match. Mirrors the VST2 ranking: a recorded class GUID outranks the
+/// recorded bundle path, which outranks the name-only fallback.
+///
+/// When both the state and the candidate carry class IDs, the GUID alone
+/// decides: a matching name or path with a different GUID is a different
+/// plug-in and must not fall through to the weaker matches.
+fn vst3_candidate_match_rank(
+    candidate: &PluginCandidate,
+    class_uid: Option<&str>,
+    plugin_path: Option<&str>,
+    plugin_name: Option<&str>,
+) -> Option<u8> {
+    if candidate.format != PluginFormat::Vst3 {
+        return None;
+    }
+    if let Some(class_uid) = class_uid.filter(|_| !candidate.class_ids.is_empty()) {
+        return candidate
+            .class_ids
+            .iter()
+            .any(|candidate_uid| candidate_uid.eq_ignore_ascii_case(class_uid))
+            .then_some(3);
+    }
+    if let Some(recorded_path) = plugin_path.filter(|path| !path.is_empty()) {
+        let recorded = recorded_path.replace('\\', "/");
+        let candidate_path = candidate.path.to_string_lossy().replace('\\', "/");
+        if recorded.eq_ignore_ascii_case(&candidate_path) {
+            return Some(2);
+        }
+    }
+    candidate_matches_vst_identity(candidate, class_uid, plugin_path, plugin_name).then_some(1)
+}
+
+/// Pick the best-matching VST3 candidate. Distinct bundles tied at the
+/// best rank are an ambiguous match and resolve to `None` rather than
+/// whichever bundle the directory scan happened to list first.
+fn select_vst3_candidate<'a>(
+    candidates: &'a [PluginCandidate],
+    class_uid: Option<&str>,
+    plugin_path: Option<&str>,
+    plugin_name: Option<&str>,
+) -> Option<&'a PluginCandidate> {
+    let ranked = candidates
+        .iter()
+        .filter_map(|candidate| {
+            vst3_candidate_match_rank(candidate, class_uid, plugin_path, plugin_name)
+                .map(|rank| (rank, candidate))
+        })
+        .collect::<Vec<_>>();
+    let best_rank = ranked.iter().map(|(rank, _)| *rank).max()?;
+    let mut best = ranked
+        .iter()
+        .filter(|(rank, _)| *rank == best_rank)
+        .map(|(_, candidate)| *candidate);
+    let candidate = best.next()?;
+    if best.any(|other| other.path != candidate.path) {
+        return None;
+    }
+    Some(candidate)
+}
+
 fn matching_vst3_candidate<'a>(
     candidates: &'a [PluginCandidate],
     metadata: &VstPluginStateMetadata,
 ) -> Option<&'a PluginCandidate> {
-    candidates
-        .iter()
-        .find(|candidate| candidate_matches_vst_metadata(candidate, metadata))
+    let class_uid = metadata.class_uid();
+    select_vst3_candidate(
+        candidates,
+        class_uid.as_deref(),
+        metadata.path(),
+        metadata.name(),
+    )
 }
 
 fn remap_mixer_effect_instances_after_move<T>(
@@ -9340,8 +9406,16 @@ impl DawUi {
                 home_directory,
             ))
         };
-        let edison_last_script_path =
-            edison_script_settings_file().and_then(|file| load_last_edison_script(&file));
+        // The persisted last-script path is honored only when discovery
+        // finds the same path in a script folder: the settings file is
+        // writable by other local processes, so its contents alone must
+        // never become an executed path.
+        let edison_last_script_path = edison_script_settings_file()
+            .and_then(|file| load_last_edison_script(&file))
+            .and_then(|path| {
+                match_discovered_edison_script(&edison_scripts, &path)
+                    .map(|script| script.path.clone())
+            });
         let (midi_controller_scripts, midi_script_discovery_error) =
             match user_data_directory().map(|root| root.join("Settings").join("Hardware")) {
                 Some(root) => match discover_midi_scripts(&root) {
@@ -31903,6 +31977,13 @@ impl DawUi {
             user_data_directory(),
             home_directory,
         ));
+        // A refreshed discovery is also a revalidation: forget a last
+        // script that is no longer among the discovered scripts.
+        if let Some(path) = &self.edison_last_script_path
+            && match_discovered_edison_script(&self.edison_scripts, path).is_none()
+        {
+            self.edison_last_script_path = None;
+        }
     }
 
     fn start_edison_script(
@@ -32209,7 +32290,11 @@ impl DawUi {
         let mut run_script_choice: Option<EdisonScript> = None;
         let mut run_last_script = false;
         let edison_groups = grouped_edison_scripts(&self.edison_scripts);
-        let edison_last_script = self.edison_last_script_path.clone();
+        let edison_last_script = self
+            .edison_last_script_path
+            .as_ref()
+            .and_then(|path| match_discovered_edison_script(&self.edison_scripts, path))
+            .cloned();
         let edison_script_pending = self.edison_script_pending.is_some();
         let mut preview_selection = false;
         let mut stop_preview = false;
@@ -32263,13 +32348,20 @@ impl DawUi {
                             }
                         }
                         ui.separator();
-                        if ui
-                            .add_enabled(
-                                edison_last_script.is_some() && !edison_script_pending,
-                                egui::Button::new("Run last script"),
-                            )
-                            .clicked()
-                        {
+                        let last_script_label = match &edison_last_script {
+                            Some(script) => format!("Run last script ({})", script.name),
+                            None => "Run last script".to_owned(),
+                        };
+                        let last_script_response = ui.add_enabled(
+                            edison_last_script.is_some() && !edison_script_pending,
+                            egui::Button::new(last_script_label),
+                        );
+                        let last_script_response = match &edison_last_script {
+                            Some(script) => last_script_response
+                                .on_hover_text(format!("Run {}", script.path.display())),
+                            None => last_script_response,
+                        };
+                        if last_script_response.clicked() {
                             run_last_script = true;
                             ui.close();
                         }
@@ -32477,12 +32569,24 @@ impl DawUi {
         }
         if let Some(script) = run_script_choice {
             self.start_edison_script(script.path, script.name, None, ctx);
-        } else if run_last_script && let Some(path) = self.edison_last_script_path.clone() {
-            let name = path
-                .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "script".to_owned());
-            self.start_edison_script(path, name, None, ctx);
+        } else if run_last_script {
+            // Re-validate at dispatch: only a currently discovered script
+            // may run, exactly as the MIDI script selection requires.
+            let last_script = self
+                .edison_last_script_path
+                .as_ref()
+                .and_then(|path| match_discovered_edison_script(&self.edison_scripts, path))
+                .cloned();
+            match last_script {
+                Some(script) => {
+                    self.start_edison_script(script.path, script.name, None, ctx);
+                }
+                None => {
+                    self.edison_last_script_path = None;
+                    self.status =
+                        "The last Edison script is unavailable; refresh scripts".to_owned();
+                }
+            }
         }
         if self.sample_editor_recording.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -101470,9 +101574,9 @@ mod tests {
         recording_input_targets, remove_midi_vst3_parameter_mapping,
         remove_pattern_vst3_mixer_effect_parameter_link, remove_pattern_vst3_parameter_link,
         remove_playlist_vst3_mixer_effect_parameter_link, remove_playlist_vst3_parameter_link,
-        sample_editor_selection_for_drag, serialize_internal_lfo_parameter_links,
-        serialize_midi_controller_templates, serialize_midi_mixer_control_mappings,
-        serialize_midi_vst3_parameter_mappings,
+        sample_editor_selection_for_drag, select_vst3_candidate,
+        serialize_internal_lfo_parameter_links, serialize_midi_controller_templates,
+        serialize_midi_mixer_control_mappings, serialize_midi_vst3_parameter_mappings,
         serialize_pattern_vst3_mixer_effect_parameter_links,
         serialize_pattern_vst3_parameter_links, serialize_playlist_audio_clip_envelopes,
         serialize_playlist_vst3_mixer_effect_parameter_links,
@@ -105530,6 +105634,80 @@ mod tests {
             Some("/old/Example.vst3"),
             Some("Different display name"),
         ));
+    }
+
+    #[test]
+    fn vst3_selection_rejects_ambiguous_name_only_matches() {
+        let candidate = |path: &str| PluginCandidate {
+            format: PluginFormat::Vst3,
+            name: "Synth".to_owned(),
+            path: PathBuf::from(path),
+            class_ids: Vec::new(),
+            audio_unit_components: Vec::new(),
+        };
+        let candidates = vec![
+            candidate("/plugins/a/Synth.vst3"),
+            candidate("/plugins/b/Synth.vst3"),
+        ];
+
+        // Two distinct bundles match the recorded name equally well: refuse
+        // instead of loading whichever the scan listed first.
+        assert!(
+            select_vst3_candidate(
+                &candidates,
+                None,
+                Some("/elsewhere/Synth.vst3"),
+                Some("Synth"),
+            )
+            .is_none()
+        );
+        // The recorded bundle path breaks the tie.
+        assert_eq!(
+            select_vst3_candidate(
+                &candidates,
+                None,
+                Some("/plugins/b/Synth.vst3"),
+                Some("Synth")
+            )
+            .map(|selected| selected.path.clone()),
+            Some(PathBuf::from("/plugins/b/Synth.vst3"))
+        );
+        // A single name-only match still resolves.
+        assert_eq!(
+            select_vst3_candidate(&candidates[..1], None, None, Some("Synth"))
+                .map(|selected| selected.path.clone()),
+            Some(PathBuf::from("/plugins/a/Synth.vst3"))
+        );
+    }
+
+    #[test]
+    fn vst3_selection_prefers_the_recorded_guid_over_name_and_path() {
+        let name_and_path_match = PluginCandidate {
+            format: PluginFormat::Vst3,
+            name: "Synth".to_owned(),
+            path: PathBuf::from("/plugins/Synth.vst3"),
+            class_ids: vec!["FFEEDDCCBBAA99887766554433221100".to_owned()],
+            audio_unit_components: Vec::new(),
+        };
+        let guid_match = PluginCandidate {
+            format: PluginFormat::Vst3,
+            name: "Renamed Synth".to_owned(),
+            path: PathBuf::from("/plugins/renamed.vst3"),
+            class_ids: vec!["00112233445566778899AABBCCDDEEFF".to_owned()],
+            audio_unit_components: Vec::new(),
+        };
+        let candidates = vec![name_and_path_match, guid_match];
+
+        assert_eq!(
+            select_vst3_candidate(
+                &candidates,
+                Some("00112233445566778899aabbccddeeff"),
+                Some("/plugins/Synth.vst3"),
+                Some("Synth"),
+            )
+            .map(|selected| selected.path.clone()),
+            Some(PathBuf::from("/plugins/renamed.vst3"))
+        );
     }
 
     fn test_grid() -> PianoRollGrid {
